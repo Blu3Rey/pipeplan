@@ -1,6 +1,7 @@
 import pytest
 import time
 from pipeplan.core import Pipeline, ExecutionContext, task, TaskStatus
+import concurrent.futures
 
 @pytest.fixture
 def fresh_context():
@@ -54,10 +55,7 @@ def test_missing_dependency_fails_fast():
     # Catch the error during the dynamic add_task mapping!
     with pytest.raises(ValueError, match="Parent task 'non_existent_task' not found"):
         pipe.add_task("task_a", func=return_one, depends_on={"x": "non_existent_task"})
-    # pipe.add_task("task_a", func=return_one, depends_on={"x": "non_existent_task"})
-    
-    # with pytest.raises(ValueError, match="Missing required dependency nodes"):
-    #     pipe.run()
+
     pipe.run()
 
 def test_retry_mechanism_and_exponential_backoff():
@@ -97,18 +95,47 @@ def test_parallel_execution_speed():
     """Tests that independent tasks execute concurrently, saving time."""
     @task
     def slow_task():
-        time.sleep(0.2)
+        time.sleep(0.4)
         return True
+    
+    exec_factory = lambda: concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-    with Pipeline("Parallel_Test") as pipe:
+    with Pipeline("Parallel_Test", executor_factory=exec_factory) as pipe:
         # Register 4 tasks that do not depend on each other
         t1, t2, t3, t4 = slow_task(), slow_task(), slow_task(), slow_task()
         
     start_time = time.time()
-    pipe.run(max_workers=4)
+    pipe.run()
     elapsed = time.time() - start_time
     
-    # If run sequentially, it would take 0.8 seconds.
-    # If parallelized properly, it should take ~0.2 seconds.
-    assert elapsed < 0.4
+    # If run sequentially, it would take 0.16 seconds.
+    # If parallelized properly, it should take ~0.4 seconds.
+    assert elapsed < 0.6
     assert all([n.result.status == TaskStatus.COMPLETED for n in [t1, t2, t3, t4]])
+
+def test_task_timeout_fail():
+    @task
+    def fast_task():
+        time.sleep(0.05)
+        return True
+
+    @task
+    def hung_task():
+        time.sleep(10.0)  # Effectively infinite for test purposes
+        return True
+
+    @task
+    def downstream_task(data):
+        return data
+
+    exec_factory = lambda: concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    
+    with Pipeline("timeout_test", executor_factory=exec_factory) as pipe:
+        node_a = fast_task()
+        node_b = hung_task()  # No dependency on node_a — runs concurrently
+        node_c = downstream_task(data=node_b)  # Should never run
+
+    with pytest.raises(TimeoutError) as exc_info:
+        pipe.run(task_timeout=0.5)
+
+    assert "hung_task" in str(exc_info.value)

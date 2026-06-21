@@ -2,7 +2,7 @@ import time
 import uuid
 import logging
 import concurrent.futures
-from typing import Dict, Callable, Any, List, Optional, Protocol, runtime_checkable, Set
+from typing import Dict, Callable, Any, List, Optional, Protocol, runtime_checkable, Set, overload, Union
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
@@ -30,10 +30,16 @@ class ResourceProtocol(Protocol):
 class ExecutionContext:
     def __init__(self):
         self._connections: Dict[str, ResourceProtocol] = {}
-        # THE FIX: Use a list to support nested (re-entrant) context managers
+        # Use a list to support nested (re-entrant) context managers
         self._tokens: List[contextvars.Token] = []
         
     def register_resource(self, id: str, resource: ResourceProtocol):
+        # self._connections[id] = resource
+        if not isinstance(resource, ResourceProtocol):
+            raise TypeError(
+                f"Resource '{id}' does not implement ResourceProtocol. "
+                f"Missing methods: connect, disconnect, read, write."
+            )
         self._connections[id] = resource
         
     def get_resource(self, id: str) -> ResourceProtocol:
@@ -54,14 +60,6 @@ class ExecutionContext:
         self._tokens.append(current_context.set(self))
         return self
 
-    # def __exit__(self, exc_type, exc, tb):
-    #     # Pop and reset the most recent token
-    #     if self._tokens:
-    #         current_context.reset(self._tokens.pop())
-            
-    #     # ONLY close resources if we are completely exiting the outermost block!
-    #     if not self._tokens:
-    #         self.close_all()
     def __exit__(self, exc_type, exc, tb):
         token = self._tokens.pop() if self._tokens else None
         if token:
@@ -109,7 +107,7 @@ def task(func=None, *, retries: int = 3, retry_delay: float = 1.0):
     """
     def decorator(fn: Callable):
         @wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args, **kwargs) -> Union[Any, TaskNode]:
             pipe = current_pipeline.get()
             
             # If called outside a `with Pipeline():` block, execute eagerly
@@ -134,12 +132,22 @@ def task(func=None, *, retries: int = 3, retry_delay: float = 1.0):
 # Pipeline Engine (Parallel Execution)
 # ==========================================
 class Pipeline:
-    def __init__(self, id: str, context: Optional[ExecutionContext] = None):
+    def __init__(
+        self,
+        id: str,
+        context: Optional[ExecutionContext] = None,
+        executor_factory: Callable = None
+    ):
         self.id = id
         self.nodes: Dict[str, TaskNode] = {}
         
         # Auto-detect the active context!
         self.context = context or current_context.get(None) or ExecutionContext()
+
+        # Make the pipeline  executor configurable
+        self.executor_factory = executor_factory or (
+            lambda: concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        )
         
         # Make the pipeline re-entrant as well
         self._tokens: List[contextvars.Token] = []
@@ -244,7 +252,7 @@ class Pipeline:
         node.result.end_time = time.time()
         node.result.elapsed_time = round(node.result.end_time - node.result.start_time, 4)
 
-    def run(self, max_workers: int = 4):
+    def run(self, task_timeout: float = None):
         """Executes tasks topologically, utilizing parallel threads."""
         log.info(f"Executing Pipeline: {self.id}")
         
@@ -274,13 +282,11 @@ class Pipeline:
             raise
 
         with self.context:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with self.executor_factory() as executor:
                 running_tasks = {}
                 
-                while ts.is_active():
-                    ready_nodes = ts.get_ready()
-                    
-                    for node_id in ready_nodes:
+                while ts.is_active():                    
+                    for node_id in ts.get_ready():
                         node = self.nodes[node_id]
 
                         # 1. Capture the context from the main thread
@@ -293,15 +299,22 @@ class Pipeline:
                     if not running_tasks:
                         break
                         
-                    done, _ = concurrent.futures.wait(
-                        running_tasks.keys(), 
+                    done, not_done = concurrent.futures.wait(
+                        running_tasks.keys(),
+                        timeout=task_timeout,
                         return_when=concurrent.futures.FIRST_COMPLETED
                     )
+
+                    # Handle timeout
+                    if not_done and task_timeout is not None and not done:
+                        for future in not_done:
+                            future.cancel()
+                        timed_out_ids = [running_tasks[f] for f in not_done]
+                        raise TimeoutError(f"Pipeline '{self.id}' timed out waiting on: {timed_out_ids}")
                     
+                    # Handle completed futures
                     for future in done:
                         node_id = running_tasks.pop(future)
-                        # future.result()  
-                        # ts.done(node_id)
                         try:
                             future.result()
                             ts.done(node_id)
@@ -309,6 +322,6 @@ class Pipeline:
                             # Cancel all pending futures
                             for pending in running_tasks:
                                 pending.cancel()
-                            raise RuntimeError(f"Task '{node_id}' failed: {e}") from e
+                            raise RuntimeError(f"Pipeline '{self.id}' aborted: task '{node_id}' failed: {e}") from e
                         
         log.info(f"Pipeline '{self.id}' execution finished.")
