@@ -1,0 +1,24 @@
+resources:
+  excel_source:
+    adapter: file
+    params:
+      format: excel
+      path: "${env:DATA_DIR}/sales.xlsx"
+      options:
+        na_values: []          # keep "AM" as a region code, not a null
+    allow: [read]
+
+  regions_source:
+    adapter: file
+    params: { format: json, path: "${env:DATA_DIR}/regions.json" }
+    allow: [read]
+
+  inventory_db:
+    adapter: db
+    params: { engine: sqlite, path: "${env:DATA_DIR}/inventory.db" }
+    allow: [read]
+
+  warehouse:
+    adapter: db
+    params: { engine: sqlite, path: "${env:DATA_DIR}/warehouse.db" }
+    allow: [read, write]

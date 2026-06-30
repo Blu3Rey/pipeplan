@@ -1,0 +1,97 @@
+tasks:
+  clean_orders:
+    extends: strict_transform
+    input: orders_raw
+    output: orders_clean
+    output_contract: orders_clean
+    steps:
+      - { action: label, with: { status_code: status } }
+      - action: select
+        with: [order_id, cust_id, product_id, status, amount, qty, order_date]
+      - id: strip_text
+        action: replace
+        with:
+          order_id: { regex: "^ORD-", swap: "" }
+          amount:   { regex: "[$,]", swap: "" }
+      - { action: map, with: { status: "${var:status_decode}" } }
+      - action: cast
+        on_error: quarantine
+        with: { order_id: integer, amount: float, qty: integer, order_date: date }
+      - { action: dedupe, with: { "on": order_id, keep: first } }
+      - { action: fillna, with: { discount: 0.0 } }
+      - action: derive
+        with: { target: line_total, expr: { "*": [{ col: amount }, { col: qty }] } }
+    expectations:
+      - { name: keys_present, assert: { column: order_id, not_null: true } }
+      - { name: nonempty,     assert: { row_count: { ">=": 1 } } }
+      - name: amounts_sane
+        assert: { column: amount, min: 0 }
+        on_failure: warn
+
+  normalize_customers:
+    stage: transform
+    input: customers_raw
+    output: customers_clean
+    steps:
+      - { action: normalize, with: { cust_name: [strip, title] } }
+
+  filter_orders:
+    stage: transform
+    input: orders_clean
+    output: orders_filtered
+    steps:
+      - action: filter
+        with:
+          AND:
+            - { status: { op: "==", value: completed } }
+            - { amount: { op: ">", value: "${var:min_order_amount}" } }
+      - { action: dedupe, with: { "on": order_id } }
+      - { action: sort, with: { amount: desc } }
+
+  enrich_orders:
+    stage: transform
+    output: orders_enriched
+    depends_on: [filter_orders, normalize_customers, extract_regions]
+    steps:
+      - action: merge
+        with: { left: orders_filtered, right: customers_clean, how: left, "on": cust_id }
+      - action: join
+        with: { left: "${pipe}", right: regions_raw, how: left, "on": region_code }
+
+  finalize_orders:
+    stage: transform
+    input: orders_enriched
+    output: orders_final
+    output_contract: orders_final
+    depends_on: [enrich_orders, extract_products]
+    steps:
+      - action: merge
+        with: { left: "${pipe}", right: products_raw, how: left, "on": product_id }
+      - action: derive
+        with:
+          target: margin
+          expr: { "-": [{ col: line_total }, { "*": [{ col: unit_cost }, { col: qty }] }] }
+
+  rank_orders:
+    stage: transform
+    input: orders_final
+    output: orders_ranked
+    steps:
+      - action: window
+        with:
+          partition_by: [cust_id]
+          order_by: { order_date: desc }
+          add:
+            recency_rank: { fn: row_number }
+            running_total: { fn: cumsum, column: line_total }
+
+  region_rollup:
+    stage: transform
+    input: orders_final
+    output: region_summary
+    steps:
+      - action: group
+        with:
+          by: region_name
+          agg: { line_total: sum, margin: sum, order_id: count }
+      - { action: label, with: { order_id: order_count } }

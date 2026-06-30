@@ -1,0 +1,24 @@
+tasks:
+  extract_sales:
+    stage: extract
+    resource: excel_source
+    steps:
+      - { collection: orders, output: orders_raw }
+      - { collection: customers, output: customers_raw }
+
+  extract_regions:
+    stage: extract
+    resource: regions_source
+    steps:
+      - { output: regions_raw }
+
+  extract_products:
+    stage: extract
+    resource: inventory_db
+    incremental:
+      strategy: watermark
+      cursor: updated_at
+      lookback: 1d
+      initial: "2026-01-01"
+    steps:
+      - { collection: products, output: products_raw }

@@ -1,0 +1,23 @@
+schemas:
+  orders_clean:
+    primary_key: [order_id]
+    strict: true
+    columns:
+      order_id:    { dtype: integer, nullable: false, unique: true }
+      cust_id:     { dtype: integer, nullable: false }
+      product_id:  { dtype: integer, nullable: false }
+      status:      { dtype: string,  nullable: false, allowed: [completed, pending, cancelled] }
+      amount:      { dtype: float,   nullable: false, checks: [{ ">=": 0 }] }
+      qty:         { dtype: integer, nullable: false, checks: [{ ">": 0 }] }
+      order_date:  { dtype: date,    nullable: false }
+      discount:    { dtype: float,   nullable: false }
+      line_total:  { dtype: float,   nullable: false, checks: [{ ">=": 0 }] }
+
+  orders_final:
+    primary_key: [order_id]
+    strict: false
+    columns:
+      order_id:    { dtype: integer, nullable: false, unique: true }
+      cust_id:     { dtype: integer, nullable: false }
+      line_total:  { dtype: float,   nullable: false }
+      margin:      { dtype: float }
