@@ -58,12 +58,15 @@ _COMPARATORS = {
     "<=": lambda s, v: s <= v,
 }
 
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
 
 # --------------------------------------------------------------------------- #
 # schema contract
 # --------------------------------------------------------------------------- #
+
 
 class ColumnSchema(StrictModel):
     dtype: str | None = None
@@ -72,9 +75,11 @@ class ColumnSchema(StrictModel):
     allowed: list[Any] | None = None
     checks: list[dict[str, Any]] = Field(default_factory=list)
 
+
 class ForeignKey(StrictModel):
     column: str
-    references: str # "<dataframe>.<column>"
+    references: str  # "<dataframe>.<column>"
+
 
 class DataframeContract(StrictModel):
     name: str | None = None
@@ -101,12 +106,12 @@ class DataframeContract(StrictModel):
                 continue
             series = df[col_name]
             problems.extend(self._check_column(col_name, series, spec))
-        
+
         if self.strict:
             extra = cols - set(self.columns)
             if extra:
                 problems.append(f"unexpected column(s) {sorted(extra)} (strict schema)")
-        
+
         for key in self.primary_key:
             if key not in cols:
                 problems.append(f"primary key column '{key}' is absent")
@@ -117,10 +122,10 @@ class DataframeContract(StrictModel):
             if pk.duplicated().any():
                 dupes = int(pk.duplicated().sum())
                 problems.append(f"primary key {self.primary_key} has {dupes} duplicate row(s)")
-        
+
         if state is not None:
             problems.extend(self._check_foreign_keys(df, state))
-        
+
         if problems:
             joined = "; ".join(problems)
             raise ContractError(f"contract violation for {label}: {joined}")
@@ -158,7 +163,7 @@ class DataframeContract(StrictModel):
                         f"column '{name}': {int(violations.sum())} value(s) fail check {op} {value}"
                     )
         return out
-    
+
     def _check_foreign_keys(self, df: pd.DataFrame, state: Any) -> list[str]:
         out: list[str] = []
         for fk in self.foreign_keys:
@@ -167,7 +172,7 @@ class DataframeContract(StrictModel):
                 continue
             ref_frame, _, ref_col = fk.references.partition(".")
             if not state.has(ref_frame):
-                continue    # referenced frame not materialised yet -> skip silently
+                continue  # referenced frame not materialised yet -> skip silently
             ref = state.get(ref_frame, copy=False)
             if ref_col not in ref.columns:
                 out.append(f"foreign key target '{fk.references}' column not found")
@@ -180,6 +185,7 @@ class DataframeContract(StrictModel):
                     f"missing from {fk.references}"
                 )
         return out
+
 
 # --------------------------------------------------------------------------- #
 # expectations

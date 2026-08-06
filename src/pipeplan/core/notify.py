@@ -15,9 +15,11 @@ from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger("pipeplan.notify")
 
+
 @runtime_checkable
 class Notifier(Protocol):
     def notify(self, event: str, message: str, target: str | None = None) -> None: ...
+
 
 class LoggingNotifier:
     """Default notifier: emits a warning-level log line per event."""
@@ -26,19 +28,21 @@ class LoggingNotifier:
         dest = f" -> {target}" if target else ""
         logger.warning("[notify:%s%s] %s", event, dest, message)
 
+
 class CompositeNotifier:
     """Fan a notification out to several channel notifiers."""
 
     def __init__(self, channels: list[tuple[str, Notifier, str | None]]) -> None:
         # (channel_type, notifier, target)
         self._channels = channels
-    
+
     def notify(self, event: str, message: str, target: str | None = None) -> None:
         for _type, notifier, chan_target in self._channels:
             try:
                 notifier.notify(event, message, chan_target)
-            except Exception:   # pragma: no cover - a broken channel must not abort
+            except Exception:  # pragma: no cover - a broken channel must not abort
                 logger.exception("notifier channel %r failed", _type)
+
 
 def build_notifier(channels: list[dict]) -> CompositeNotifier:
     """Construct a composite notifier from orchestration channel configs.
@@ -62,8 +66,9 @@ def build_notifier(channels: list[dict]) -> CompositeNotifier:
         built.append(("log", LoggingNotifier(), None))
     return CompositeNotifier(built)
 
-# Register the always-available default channel.
-from .registry import NOTIFIERS # noqa: E402
 
-if "log" not in NOTIFIERS._items:   # idempotent on re-import
+# Register the always-available default channel.
+from .registry import NOTIFIERS  # noqa: E402
+
+if "log" not in NOTIFIERS._items:  # idempotent on re-import
     NOTIFIERS.register("log", LoggingNotifier)

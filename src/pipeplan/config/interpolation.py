@@ -32,6 +32,7 @@ _FULL = re.compile(r"^\$\{(\w+):([^}]*)\}$")
 
 Resolver = Callable[[str], Any]
 
+
 def resolve(
     data: Any,
     resolvers: Mapping[str, Resolver],
@@ -48,6 +49,7 @@ def resolve(
         return _resolve_string(data, resolvers, strict=strict, secret_sink=secret_sink)
     return data
 
+
 def _lookup(ns: str, ref: str, resolvers: Mapping[str, Resolver], *, strict: bool) -> Any:
     resolver = resolvers.get(ns)
     if resolver is None:
@@ -61,10 +63,13 @@ def _lookup(ns: str, ref: str, resolvers: Mapping[str, Resolver], *, strict: boo
             raise InterpolationError(f"cannot resolve ${{{ns}:{ref}}}") from None
         return _MISSING
 
+
 class _Missing:
     pass
 
+
 _MISSING = _Missing()
+
 
 def _resolve_string(
     value: str,
@@ -78,11 +83,11 @@ def _resolve_string(
         ns, ref = full.group(1), full.group(2)
         resolved = _lookup(ns, ref, resolvers, strict=strict)
         if resolved is _MISSING:
-            return value    # leave token intact (non-strict)
+            return value  # leave token intact (non-strict)
         if ns == "secret" and secret_sink is not None and isinstance(resolved, str):
             secret_sink.add(resolved)
         return resolved
-    
+
     def _sub(match: re.Match[str]) -> str:
         ns, ref = match.group(1), match.group(2)
         resolved = _lookup(ns, ref, resolvers, strict=strict)
@@ -91,5 +96,5 @@ def _resolve_string(
         if ns == "secret" and secret_sink is not None:
             secret_sink.add(str(resolved))
         return str(resolved)
-    
+
     return _TOKEN.sub(_sub, value)

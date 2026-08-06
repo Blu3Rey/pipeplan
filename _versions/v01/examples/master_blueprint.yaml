@@ -1,0 +1,142 @@
+# =============================================================================
+# PipePlan master blueprint -- the canonical v1 reference (apiVersion pipeplan/v1)
+# =============================================================================
+# This is the corrected successor to the original JSON template. Four defects in
+# that template are fixed here and called out inline:
+#   (1) the excel resource is read in an extract step, so it must allow `read`;
+#   (2) directory tokens use the ${env:...} namespace (was a typo'd ${ACESS_DIR});
+#   (3) the postgres URI has no JDBC prefix (SQLAlchemy URLs are not JDBC URLs);
+#   (4) every db resource names its backend with a single, consistent `engine`.
+#
+# Parsed as YAML 1.2 semantics; join keys are quoted ("on") so a YAML-1.1 parser
+# cannot misread them as booleans.
+
+apiVersion: pipeplan/v1
+kind: Pipeline
+
+metadata:
+  id: billing_pipeline
+  owner: data-engineering
+  description: Reference pipeline exercising contracts, incremental, and SCD2.
+
+settings:
+  timezone: America/New_York
+  engine: pandas
+
+parameters:
+  run_date: { type: date, required: true }
+
+partition:
+  field: submission_date
+  granularity: day
+  bounds: { start: "${param:run_date}", lookback: 1d }
+
+defaults:
+  retry: { attempts: 3, delay: 30s, backoff: 2, timeout: 10m }
+  on_failure: fail
+  checkpoint: true
+
+orchestration:
+  max_parallelism: 4
+  fail_fast: true
+  checkpoint: { enabled: true, store: "${env:PIPEPLAN_CHECKPOINT_DIR}", reuse: true }
+  watermark_store: { resource: warehouse, table: pipeplan_watermarks }
+  notifications:
+    on_failure: [{ type: log }]
+  sla: { max_runtime: 30m, warn_after: 20m }
+
+vars:
+  warehouse_schema: billing
+
+resources:
+  warehouse:
+    adapter: db
+    params:
+      engine: postgres                                   # (4) consistent key
+      uri: "postgresql://${secret:pg/user}:${secret:pg/password}@${env:PG_HOST}:5432/billing"
+    allow: [read, write]                                 # (3) clean URI, no jdbc:
+
+  grants_excel:
+    adapter: file
+    params: { format: excel, path: "${env:EXCEL_DIR}/grants.xlsx" }
+    allow: [read]                                        # (1) read, not write
+
+  contestants_access:
+    adapter: db                                          # local Access via ODBC
+    params: { engine: access, uri: "${env:ACCESS_DIR}/contestants.accdb" }  # (2) fixed token
+    allow: [read]
+
+  feed_json:
+    adapter: file
+    params: { format: json, path: "${env:JSON_DIR}/feed.json" }
+    allow: [read]
+
+schemas:
+  grants_clean:
+    primary_key: [grant_id]
+    strict: false
+    columns:
+      grant_id: { dtype: integer, nullable: false, unique: true }
+      title:    { dtype: string,  nullable: false }
+      status:   { dtype: string,  allowed: [Active, Inactive] }
+
+tasks:
+  extract_grants:
+    stage: extract
+    resource: grants_excel
+    steps:
+      - { collection: sheet_1, output: grants_raw }
+      - { collection: sheet_2, output: grants_meta }
+
+  extract_contestants:
+    stage: extract
+    resource: contestants_access
+    incremental: { strategy: watermark, cursor: updated_at, lookback: 1d }
+    steps:
+      - { collection: contestants, output: contestants_raw }
+
+  extract_feed:
+    stage: extract
+    resource: feed_json
+    steps:
+      - { output: feed_raw }
+
+  clean_grants:
+    stage: transform
+    input: grants_raw
+    output: grants_clean
+    output_contract: grants_clean
+    steps:
+      - { action: label, with: { Grant_ID: grant_id, Project_Title: title } }
+      - action: replace
+        with: { grant_id: { regex: "^JJC-", swap: "", flags: i } }
+      - { action: cast, on_error: quarantine, with: { grant_id: integer } }
+      - { action: map, with: { status: { Open: Active, Closed: Inactive } } }
+      - { action: normalize, with: { title: [nfkc, strip, upper] } }
+    expectations:
+      - { name: has_rows, assert: { row_count: { ">=": 1 } } }
+
+  enrich_grants:
+    stage: transform
+    output: grants_enriched
+    depends_on: [clean_grants, extract_feed]
+    steps:
+      - action: merge
+        with: { left: grants_clean, right: feed_raw, how: left, "on": grant_id }
+
+  load_billing:
+    stage: load
+    resource: warehouse
+    steps:
+      - input: grants_enriched
+        collection: fact_grants
+        mode: upsert
+        key: [grant_id]
+        input_contract: grants_clean
+        write: { partition_by: [submission_date], chunksize: 50000 }
+      - input: contestants_raw
+        collection: dim_contestant
+        mode: scd2
+        key: [contestant_id]
+        scd: { track: [name, percentile], effective_from: valid_from,
+               effective_to: valid_to, current_flag: is_current }

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .secrets import SecretProvider
     from .watermark import WatermarkStore
 
+
 @dataclass(slots=True)
 class ExecutionContext:
     config: "PipelineConfig"

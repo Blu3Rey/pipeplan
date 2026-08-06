@@ -12,12 +12,13 @@ from typing import Any
 
 logger = logging.getLogger("pipeplan.watermark")
 
+
 class WatermarkStore:
     def __init__(self, adapter: Any, table: str = "pipeplan_watermarks") -> None:
         self._adapter = adapter
         self._table = table
         self._ensured = False
-    
+
     def _ensure(self) -> None:
         if self._ensured:
             return
@@ -28,7 +29,7 @@ class WatermarkStore:
             f'updated_at TEXT, PRIMARY KEY (pipeline, task, cursor))'
         )
         self._ensured = True
-    
+
     def get(self, pipeline: str, task: str, cursor: str) -> Any:
         try:
             self._ensure()
@@ -37,10 +38,10 @@ class WatermarkStore:
                 f'WHERE pipeline = :p AND task = :t AND cursor = :c',
                 {"p": pipeline, "t": task, "c": cursor},
             )
-        except Exception:   # pragma: no cover - store unavailable -> full read
+        except Exception:  # pragma: no cover - store unavailable -> full read
             logger.warning("watermark get failed for %s/%s; treating as cold start", pipeline, task)
             return None
-    
+
     def set(self, pipeline: str, task: str, cursor: str, value: Any) -> None:
         if value is None:
             return
@@ -55,7 +56,7 @@ class WatermarkStore:
             f'INSERT INTO "{self._table}" (pipeline, task, cursor, value, updated_at) '
             f'VALUES (:p, :t, :c, :v, :u)',
             {
-                "p":pipeline, "t": task, "c": cursor,
+                "p": pipeline, "t": task, "c": cursor,
                 "v": str(value), "u": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             },
         )

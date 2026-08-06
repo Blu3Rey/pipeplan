@@ -18,6 +18,7 @@ import pandas as pd
 
 from .exceptions import StateError
 
+
 class StateManager:
     """In-memory registry of named dataframes flowing through the pipeline.
 
@@ -31,20 +32,20 @@ class StateManager:
     def __init__(self) -> None:
         self._frames: dict[str, pd.DataFrame] = {}
         self._lock = threading.RLock()
-    
+
     def set(self, name: str, frame: pd.DataFrame) -> None:
         """Store ``frame`` under ``name``, overwriting any previous value."""
-        if not isinstance(frame, pd.DataFrame): # pragma: no cover - defensive
+        if not isinstance(frame, pd.DataFrame):  # pragma: no cover - defensive
             raise StateError(
                 f"Refusing to store non-DataFrame under '{name}' "
-                f"(got {type(frame).__name})."
+                f"(got {type(frame).__name__})."
             )
         with self._lock:
             self._frames[name] = frame
-    
+
     def get(self, name: str, *, copy: bool = True) -> pd.DataFrame:
         """Return the dataframe stored under ``name``.
-        
+
         A defensive copy is returned by default so the caller can mutate it
         freely without corrupting the shared state.
         """
@@ -58,28 +59,28 @@ class StateManager:
                     f"Currently materialised: {available}."
                 ) from None
             return frame.copy() if copy else frame
-    
+
     def has(self, name: str) -> bool:
         with self._lock:
             return name in self._frames
-    
+
     def names(self) -> list[str]:
         with self._lock:
             return sorted(self._frames)
-    
+
     def drop(self, name: str) -> None:
         with self._lock:
             self._frames.pop(name, None)
-    
+
     def __contains__(self, name: object) -> bool:
         return name in self._frames
-    
+
     def __iter__(self) -> Iterator[str]:
         return iter(self._frames)
-    
+
     def __len__(self) -> int:
         return len(self._frames)
-    
+
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         sizes = {name: frame.shape for name, frame in self._frames.items()}
         return f"StateManager({sizes})"

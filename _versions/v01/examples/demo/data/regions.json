@@ -1,0 +1,14 @@
+[
+  {
+    "region_code": "AM",
+    "region_name": "North America"
+  },
+  {
+    "region_code": "EU",
+    "region_name": "Europe"
+  },
+  {
+    "region_code": "AP",
+    "region_name": "Asia Pacific"
+  }
+]
