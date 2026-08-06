@@ -1,0 +1,463 @@
+# =============================================================================
+# PipePlan master blueprint — the canonical v1 reference (apiVersion pipeplan/v1)
+# =============================================================================
+# A single, fully-annotated pipeline that exercises every feature of the
+# framework: all interpolation namespaces, both adapter families, all three
+# transform tiers and every built-in verb, both AST subsystems (filter + compute),
+# schema contracts and expectations, all five load modes, incremental watermark
+# extract, and the full orchestration block.
+#
+# Four defects from the original pre-1.0 JSON template are fixed here and called
+# out inline where they occur:
+#   (1) a resource read in an extract step must allow `read`;
+#   (2) directory tokens use the ${env:...} namespace (was a typo'd ${ACESS_DIR});
+#   (3) SQLAlchemy URIs are NOT JDBC URLs — no `jdbc:` prefix;
+#   (4) every db resource names its backend with a single, consistent `engine` key.
+#
+# YAML note: join keys are quoted ("on") so a YAML-1.1 parser cannot misread them
+# as booleans. The same care is taken with any bare value that could be coerced.
+# =============================================================================
+
+apiVersion: pipeplan/v1
+kind: Pipeline
+
+# --------------------------------------------------------------------------- #
+# metadata — identity & ownership (no data semantics)
+# --------------------------------------------------------------------------- #
+metadata:
+  id: billing_warehouse
+  owner: data-engineering
+  description: >
+    Reference pipeline: ingests grant/billing snapshots from Excel, a local
+    SQLite inventory, a legacy MS Access export, a regions JSON and a department
+    CSV; cleans, shapes, enriches and fuzzy-matches them; captures the delta vs.
+    the warehouse baseline (CDC); and loads facts/dimensions with upsert, SCD2,
+    partitioned-replace, append and delete modes.
+
+# --------------------------------------------------------------------------- #
+# imports — modular fragments, deep-merged key-by-key before validation.
+# This reference is intentionally single-file; in production split it, e.g.:
+#
+# imports:
+#   - fragments/vars.yaml
+#   - fragments/resources.yaml
+#   - fragments/schemas.yaml
+#   - fragments/tasks/extract.yaml
+#   - fragments/tasks/transform.yaml
+#   - fragments/tasks/load.yaml
+#
+# `resources`, `schemas`, `vars` and `tasks` may each be spread across files;
+# mappings merge, so every fragment contributes its slice.
+# --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# settings — global run settings
+# --------------------------------------------------------------------------- #
+settings:
+  timezone: America/New_York
+
+# --------------------------------------------------------------------------- #
+# parameters — typed run inputs, coerced & validated before anything else.
+# Bind from the CLI with `--param key=value` (repeatable) or load_config(params=).
+# --------------------------------------------------------------------------- #
+parameters:
+  run_date:    { type: date,   required: true }            # e.g. --param run_date=2026-01-01
+  region:      { type: string, default: GLOBAL }
+  full_reload: { type: bool,   default: false }
+  batch_size:  { type: int,    default: 50000 }
+
+# --------------------------------------------------------------------------- #
+# defaults — folded into every task. A task may override any key locally.
+# Durations accept human units: 30s, 10m, 2h, 7d.
+# --------------------------------------------------------------------------- #
+defaults:
+  retry:    { attempts: 3, delay: 30s, backoff: 2 }
+  on_error: fail                                            # default per-step policy
+
+# --------------------------------------------------------------------------- #
+# orchestration — scheduling, resumability, watermarks, SLA, notifications.
+# --------------------------------------------------------------------------- #
+orchestration:
+  max_parallelism: 4                                        # ThreadPoolExecutor width
+  checkpoint:
+    enabled: true
+    store: "${env:PIPEPLAN_CKPT}"                           # parquet checkpoint dir
+    reuse: true                                             # resume by reusing prior outputs
+  watermark_store:
+    resource: warehouse                                     # where high-water marks persist
+    table: pipeplan_watermarks
+  sla: 30m                                                  # flag/notify if the run exceeds this
+  on_failure: notify                                        # notify | halt | continue
+  notify:
+    on: [success, failure, sla_breach]
+    channel: ops_slack                                      # resolved via the notifier registry
+
+# --------------------------------------------------------------------------- #
+# vars — reusable values, referenced via ${var:...}. Resolution is type-aware:
+# a whole-value token yields the raw value (so a list stays a list).
+# --------------------------------------------------------------------------- #
+vars:
+  status_decode:        { Open: Active, Closed: Inactive, Pending: Pending }
+  department_decode:    { "computer science": comp_sci, mathematics: math, "phys ed": gym }
+  active_regions:       [AM, EU, APAC]
+  min_award_amount:     1000
+  high_value_threshold: 250000
+  ingest_batch_id:      "${param:run_date}"                 # embedded token → textual substitution
+
+# --------------------------------------------------------------------------- #
+# schemas — per-dataframe contracts. Attached to tasks via input_contract /
+# output_contract / a per-step `contract`, enforced per `validate: off|warn|strict`.
+# dtype is matched by family: integer/int/bigint, float/double, number/numeric,
+# string/str/text, boolean/bool, date/datetime/timestamp, category.
+# --------------------------------------------------------------------------- #
+schemas:
+
+  grants_clean:
+    description: Cleaned grant master, one row per grant.
+    strict: false                                           # true → forbid undeclared columns
+    primary_key: [grant_id]
+    columns:
+      grant_id:     { dtype: integer, nullable: false, unique: true }
+      title:        { dtype: string,  nullable: false }
+      status:       { dtype: string,  allowed: [Active, Inactive, Pending] }
+      award_number: { dtype: string }
+      award_amount: { dtype: float,   nullable: false, checks: [ { op: ">=", value: 0 } ] }
+      submitted_on: { dtype: date }
+
+  grants_enriched:
+    description: Grants joined to department, region and inventory.
+    primary_key: [grant_id]
+    foreign_keys:
+      - { column: region_code, references: regions_raw.region_code }
+      - { column: dept_code,   references: departments_clean.dept_code }
+    columns:
+      grant_id:    { dtype: integer, nullable: false, unique: true }
+      region_code: { dtype: string }
+      dept_code:   { dtype: string }
+      margin:      { dtype: float }
+
+# --------------------------------------------------------------------------- #
+# resources — handles to the outside world. Two adapter families:
+#   • file → pandas I/O (excel/csv/tsv/json/parquet)
+#   • db   → SQLAlchemy for EVERY database, including local SQLite & MS Access
+#            (via ODBC). A local .accdb/.sqlite is a `db` resource with a URI,
+#            never a `file` resource.
+# `allow` is enforced inside the adapter, so a task cannot bypass it.
+# --------------------------------------------------------------------------- #
+resources:
+
+  # --- file adapters ------------------------------------------------------- #
+  source_xlsx:
+    adapter: file
+    params: { format: excel, path: "${env:EXCEL_DIR}/billing.xlsx" }
+    allow: [read]                                           # FIX (1): read in extract ⇒ allow read
+
+  departments_csv:
+    adapter: file
+    params: { format: csv, path: "${env:CSV_DIR}/departments.csv" }
+    allow: [read]
+
+  regions_json:
+    adapter: file
+    params: { format: json, path: "${env:JSON_DIR}/regions.json" }
+    allow: [read]
+
+  rejects_parquet:
+    adapter: file
+    params: { format: parquet, path: "${env:OUT_DIR}/rejects" }
+    allow: [write]
+
+  # --- db adapters (SQLAlchemy for all, including local files) -------------- #
+  warehouse:
+    adapter: db
+    params:
+      engine: postgresql                                    # FIX (4): consistent `engine` key
+      uri: "${secret:warehouse_uri}"                        # FIX (3): SQLAlchemy URL, NOT jdbc:
+    allow: [read, write]
+
+  inventory_sqlite:
+    adapter: db                                             # local SQLite ⇒ db adapter, not file
+    params:
+      engine: sqlite
+      uri: "sqlite:///${env:DATA_DIR}/inventory.sqlite"
+    allow: [read]
+
+  legacy_access:
+    adapter: db                                             # FIX (2): ${env:...} namespace
+    params:
+      engine: access
+      uri: "access+pyodbc://@${env:ACCESS_DIR}/legacy.accdb"
+    allow: [read]
+
+# --------------------------------------------------------------------------- #
+# tasks — the DAG. depends_on is ADDITIVE: the orchestrator always adds the
+# producer→consumer edges implied by output/input/${pipe}, so depends_on only
+# needs the EXTRA ordering you want. Outputs must be globally unique.
+# --------------------------------------------------------------------------- #
+tasks:
+
+  # ========================= EXTRACT ====================================== #
+
+  extract_grants:
+    stage: extract
+    resource: source_xlsx                                   # scalar in v1 (was a list pre-1.0)
+    steps:
+      - { collection: grants, output: grants_raw }          # `collection` = sheet/table/section
+      - { collection: awards, output: awards_raw }
+    retry: { attempts: 5, delay: 1m, backoff: 2 }           # overrides the default retry
+
+  extract_inventory:
+    stage: extract
+    resource: inventory_sqlite
+    steps:
+      # Incremental read: only rows whose cursor advanced since the last run,
+      # with a safety lookback. For db resources the predicate is pushed down.
+      - collection: inventory
+        output: inventory_raw
+        incremental:
+          strategy: watermark
+          cursor: updated_at
+          lookback: 1d
+          initial: "2026-01-01"
+
+  extract_legacy:
+    stage: extract
+    resource: legacy_access
+    steps:
+      - { collection: grant_history, output: legacy_raw }
+
+  extract_departments:
+    stage: extract
+    resource: departments_csv
+    steps:
+      - { collection: departments, output: departments_raw }
+
+  extract_regions:
+    stage: extract
+    resource: regions_json
+    steps:
+      - { collection: regions, output: regions_raw }
+
+  extract_baseline:
+    stage: extract
+    resource: warehouse
+    steps:
+      - { collection: dim_grant, output: warehouse_baseline }
+
+  # ========================= TRANSFORM ==================================== #
+
+  # --- Element tier: 1:1 column-axis ops --------------------------------- #
+  clean_grants:
+    stage: transform
+    input: grants_raw
+    output: grants_clean
+    output_contract: grants_clean                           # enforce the contract on output
+    validate: strict                                        # off | warn | strict
+    steps:
+      - action: label                                       # rename columns
+        with: { Grant_ID: grant_id, Project_Title: title, Award_No: award_number, Amount: award_amount }
+
+      - action: replace                                     # per-column regex substitution
+        with:
+          grant_id:     { regex: "^jjc-", swap: "", flags: i }
+          award_amount: { regex: "[$,]",  swap: "" }
+
+      - action: cast                                        # coerce dtypes; quarantine bad rows
+        on_error: quarantine                                # unparseable rows → grants_clean__rejected
+        with:
+          grant_id:     integer
+          award_amount: float
+          submitted_on: date
+
+      - action: map                                         # value remapping (var-driven table)
+        with: { status: "${var:status_decode}" }
+
+      - action: affix                                       # prefix/suffix string columns
+        with: { award_number: { text: "AWD-", position: prefix } }
+
+      - action: normalize                                   # chained string normalisation
+        with:
+          title:  [nfkc, strip, upper]
+          status: [strip, title]
+
+      - action: fillna                                      # fill missing values per column
+        with: { award_amount: 0.0, status: Pending }
+
+      - action: derive                                      # compute via the expression AST
+        with:
+          target: award_amount_k
+          expr: { "/": [{ col: award_amount }, { lit: 1000 }] }
+
+      - action: select                                      # Element-tier projection + reorder
+        with: [grant_id, title, status, award_number, award_amount, award_amount_k, submitted_on]
+    expectations:                                           # soft data-quality assertions
+      - { name: keys_present, assert: { column: grant_id, not_null: true } }
+      - { name: nonempty,     assert: { row_count: { ">=": 1 } } }
+      - name: amounts_sane
+        assert: { column: award_amount, min: 0 }
+        on_failure: warn                                    # warn | fail
+
+  clean_departments:
+    stage: transform
+    input: departments_raw
+    output: departments_clean
+    steps:
+      - { action: label,     with: { Dept_Code: dept_code, Dept_Name: dept_name } }
+      - { action: map,       with: { dept_name: "${var:department_decode}" } }
+      - { action: normalize, with: { dept_name: [strip, lower] } }
+      - { action: drop,      with: { columns: [_ingest_batch, _staging_hash], ignore_missing: true } }
+
+  # --- Set tier: row-axis masking & reshaping ---------------------------- #
+  shape_grants:
+    stage: transform
+    input: grants_clean
+    output: grants_shaped
+    steps:
+      - action: filter                                      # predicate AST (AND/OR/NOT + leaves)
+        with:
+          AND:
+            - { status:       { op: "==",      value: Active } }
+            - { award_amount: { op: ">=",      value: "${var:min_award_amount}" } }
+            - { award_number: { op: notnull } }
+            - OR:
+                - { region_code: { op: in,       value: "${var:active_regions}" } }
+                - { award_amount: { op: between, value: [100000, 500000] } }
+            - NOT: { title: { op: contains, value: "TEST" } }
+
+      - action: sort
+        with: { award_amount: desc, grant_id: asc }
+
+      - action: dedupe                                      # key-wise de-dup (NOT aggregation)
+        with: { on: grant_id, keep: first }
+
+      - action: window                                      # partitioned window functions
+        with:
+          partition_by: [status]
+          order_by: { award_amount: desc }
+          add:
+            amount_rank:    { fn: dense_rank, column: award_amount }
+            row_in_status:  { fn: row_number }
+            running_total:  { fn: cumsum, column: award_amount }
+
+  rollup_by_status:
+    stage: transform
+    input: grants_shaped
+    output: status_rollup
+    steps:
+      - action: group                                       # group ALWAYS aggregates ⇒ agg required
+        with:
+          by: status
+          agg: { award_amount: sum, grant_id: count }
+
+  # --- Collection tier: relational ops; operands named, ${pipe} = flowing - #
+  enrich_grants:
+    stage: transform
+    output: grants_enriched
+    output_contract: grants_enriched
+    validate: warn
+    depends_on: [shape_grants, clean_departments, extract_regions, extract_inventory]
+    steps:
+      - action: merge                                       # first op: both operands explicit
+        with: { left: grants_shaped, right: departments_clean, how: left, "on": dept_code }
+
+      - action: join                                        # bind previous result with ${pipe}
+        with: { left: "${pipe}", right: regions_raw, how: left, "on": region_code }
+
+      - action: merge
+        with: { left: "${pipe}", right: inventory_raw, how: left, "on": grant_id }
+
+      - action: derive                                      # nested expression AST
+        with:
+          target: margin
+          expr:
+            "-":
+              - { col: award_amount }
+              - { "*": [{ col: unit_cost }, { col: qty }] }
+
+      - action: filter                                      # post-join filter
+        with:
+          OR:
+            - { region_code: { op: in,  value: "${var:active_regions}" } }
+            - { margin:      { op: ">=", value: "${var:high_value_threshold}" } }
+
+  combine_history:
+    stage: transform
+    output: grants_unified
+    depends_on: [enrich_grants, extract_legacy]
+    steps:
+      - action: union                                       # vertical concat of like-shaped frames
+        with: { frames: ["${pipe_or_named}"], how: outer }  # see note below
+      # NOTE: `union` needs ≥1 explicit frame. Since this task opens with the
+      # collection op, name both frames rather than relying on a flowing input:
+      # with: { frames: [grants_enriched, legacy_raw], how: outer }
+
+  match_departments_fuzzy:
+    stage: transform
+    input: grants_unified
+    output: grants_matched
+    steps:
+      - action: fuzzy_join                                  # extract unique keys → score → broadcast
+        with:
+          left: "${pipe}"
+          right: departments_clean
+          left_on: dept_name_freetext
+          right_on: dept_name
+          threshold: 0.85
+          how: left
+
+  # --- CDC: capture the delta vs. the warehouse baseline ----------------- #
+  capture_changes:
+    stage: transform
+    output: grants_delta
+    depends_on: [match_departments_fuzzy, extract_baseline]
+    steps:
+      - action: compare_diff
+        with:
+          source: grants_matched                            # new snapshot (or ${pipe})
+          target: warehouse_baseline                        # previous snapshot
+          key: grant_id                                     # composite ⇒ a list, e.g. [grant_id, fy]
+          compare: [title, status, award_number, award_amount]
+          ignore: [_ingest_batch]
+          change_detection: exact                           # exact (null-safe) | hash (wide frames)
+          emit: [insert, update, delete]                    # add `unchanged` for a full audit
+          op_column: _op
+          op_labels: { insert: I, update: U, delete: D }
+          duplicate_keys: error                             # error | keep_first | keep_last
+
+  # ========================= LOAD ========================================= #
+  # Every mode is idempotent for a given key/partition; loaders chunk writes.
+
+  load_warehouse:
+    stage: load
+    resource: warehouse
+    depends_on: [capture_changes, enrich_grants, rollup_by_status, clean_grants]
+    steps:
+      # upsert: insert new keys, update existing (the I/U rows from the delta)
+      - { collection: dim_grant, input: grants_delta, mode: upsert, key: grant_id }
+
+      # delete: remove the D rows captured by compare_diff
+      - { collection: dim_grant, input: grants_delta, mode: delete, key: grant_id }
+
+      # scd2: Type-2 history with effective dating + current flag
+      - collection: dim_grant_history
+        input: grants_delta
+        mode: scd2
+        key: grant_id
+        scd2: { effective_from: valid_from, effective_to: valid_to, current_flag: is_current }
+
+      # replace, partition-scoped: only rewrites partitions present in the frame
+      - collection: fact_grant_enriched
+        input: grants_enriched
+        mode: replace
+        write: { partition_by: [region_code] }
+
+      # append: pure insert, no key logic (audit/rollup table)
+      - { collection: agg_status_rollup, input: status_rollup, mode: append }
+
+  archive_rejects:
+    stage: load
+    resource: rejects_parquet
+    depends_on: [clean_grants]
+    steps:
+      # the quarantine frame produced by cast on_error: quarantine
+      - { collection: grants_rejected, input: grants_clean__rejected, mode: replace }

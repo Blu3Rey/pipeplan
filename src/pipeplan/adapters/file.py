@@ -15,4 +15,18 @@ from typing import Any, ClassVar
 
 import pandas as pd
 
-from 
+from ..config.models import LoadMode, Permission, ResourceConfig
+from ..core.exceptions import AdapterError
+from .base import Adapter
+
+class FileAdapter(Adapter):
+    """Read and write dataframes to a single file on disk."""
+
+    SUPPORTED: ClassVar[frozenset[str]] = frozenset(
+        {"excel", "xlsx", "xls", "csv", "tsv", "json", "parquet"}
+    )
+
+    def __init__(self, config: ResourceConfig) -> None:
+        super().__init__(config)
+        params = config.params
+        # Last Here
