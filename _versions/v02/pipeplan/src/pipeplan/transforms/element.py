@@ -11,7 +11,7 @@ import re
 from typing import Any, ClassVar, Literal
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, model_validator, field_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from ..ast.expression import ExpressionNode
 from ..core.context import ExecutionContext
@@ -110,33 +110,17 @@ class ReplaceTransform(_ColumnMapped):
     """Vectorised regex substitution per column."""
 
     tier: ClassVar[Tier] = Tier.ELEMENT
-    # columns: dict[str, ReplaceSpec]
-    columns: dict[str, list[ReplaceSpec]]
-
-    @field_validator("columns", mode="before")
-    @classmethod
-    def _coerce_list(cls, value: object) -> object:
-        for key, val in value.items():
-            if isinstance(val, dict):
-                value[key] = [val]
-        return value
+    columns: dict[str, ReplaceSpec]
 
     def apply(self, df: pd.DataFrame | None, ctx: ExecutionContext) -> pd.DataFrame:
         assert df is not None
         _require_columns(df, list(self.columns), "replace")
-        # for column, spec in self.columns.items():
-        #     df[column] = (
-        #         df[column]
-        #         .astype("string")
-        #         .str.replace(spec.regex, spec.swap, regex=True, flags=spec.compiled_flags())
-        #     )
-        for column, specs in self.columns.items():
-            for spec in specs:
-                df[column] = (
-                    df[column]
-                    .astype("string")
-                    .str.replace(spec.regex, spec.swap, regex=True, flags=spec.compiled_flags())
-                )
+        for column, spec in self.columns.items():
+            df[column] = (
+                df[column]
+                .astype("string")
+                .str.replace(spec.regex, spec.swap, regex=True, flags=spec.compiled_flags())
+            )
         return df
 
 

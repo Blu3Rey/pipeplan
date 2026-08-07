@@ -1,0 +1,5 @@
+- Excludes collection transform operation "compare_diff"
+- Removes pydantic field_validator for operations
+- Reworks collection operations "merge" and "join"
+- Moved and reworked "projection" operations from standalone file to "set_ops" file
+- Developed "pipe" operand with Runtime resolution (Alot of discrepencies regarding this)

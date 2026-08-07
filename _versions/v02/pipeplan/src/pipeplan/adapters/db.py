@@ -232,120 +232,27 @@ class DBAdapter(Adapter):
 
     # -- upsert ------------------------------------------------------------ #
 
-    # def _upsert(self, frame, collection, keys, chunksize) -> None:
-    #     if not keys:
-    #         raise AdapterError(f"resource '{self.name}': upsert into '{collection}' requires a key")
-    #     inspector = sa_inspect(self.engine)
-    #     with self.engine.begin() as conn:
-    #         if not inspector.has_table(collection):
-    #             frame.to_sql(collection, conn, if_exists="append",
-    #                          index=False, chunksize=chunksize, method="multi")
-    #             return
-    #         staging = f"__pipeplan_stage_{collection}"
-    #         frame.to_sql(staging, conn, if_exists="replace",
-    #                      index=False, chunksize=chunksize, method="multi")
-    #         try:
-    #             join = " AND ".join(f'"{collection}"."{k}" = src."{k}"' for k in keys)
-    #             conn.execute(text(
-    #                 f'DELETE FROM "{collection}" '
-    #                 f'WHERE EXISTS (SELECT 1 FROM "{staging}" AS src WHERE {join})'
-    #             ))
-    #             conn.execute(text(f'INSERT INTO "{collection}" SELECT * FROM "{staging}"'))
-    #         finally:
-    #             conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
-    
     def _upsert(self, frame, collection, keys, chunksize) -> None:
-            if not keys:
-                raise AdapterError(f"resource '{self.name}': upsert into '{collection}' requires a key")
-            
-            # Access does not support multi-row VALUES inserts
-            insert_method = None if self.backend == "access" else "multi"
-            
-            inspector = sa_inspect(self.engine)
-            with self.engine.begin() as conn:
-                # 1. If table doesn't exist, fall back to a simple append
-                if not inspector.has_table(collection):
-                    frame.to_sql(collection, conn, if_exists="append",
-                                index=False, chunksize=chunksize, method=insert_method)
-                    return
-                
-                # 2. Stage the incoming data
-                staging = f"__pipeplan_stage_{collection}"
-                frame.to_sql(staging, conn, if_exists="replace",
-                            index=False, chunksize=chunksize, method=insert_method)
-                
-                try:
-                    columns = list(frame.columns)
-                    non_keys = [c for c in columns if c not in keys]
-                    
-                    # 3. Update existing records in-place (if non-key columns exist)
-                    if non_keys:
-                        if self.backend == "mssql":
-                            # SQL Server supports native, atomic MERGE
-                            match_cond = " AND ".join(f'T."{k}" = S."{k}"' for k in keys)
-                            update_set = ", ".join(f'"{c}" = S."{c}"' for c in non_keys)
-                            insert_cols = ", ".join(f'"{c}"' for c in columns)
-                            insert_vals = ", ".join(f'S."{c}"' for c in columns)
-                            
-                            sql = f"""
-                                MERGE INTO "{collection}" WITH (HOLDLOCK) AS T
-                                USING "{staging}" AS S
-                                ON {match_cond}
-                                WHEN MATCHED THEN UPDATE SET {update_set}
-                                WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});
-                            """
-                            conn.execute(text(sql))
-                            return  # MERGE handles both update and insert natively; exit early.
-                            
-                        elif self.backend in ("mysql", "access"):
-                            # MySQL and MS Access use INNER JOIN for updates
-                            join_cond = " AND ".join(f'"{collection}"."{k}" = src."{k}"' for k in keys)
-                            update_set = ", ".join(f'"{collection}"."{c}" = src."{c}"' for c in non_keys)
-                            
-                            update_sql = f"""
-                                UPDATE "{collection}"
-                                INNER JOIN "{staging}" AS src ON {join_cond}
-                                SET {update_set}
-                            """
-                            conn.execute(text(update_sql))
-                            
-                        else:
-                            # Postgres and SQLite (3.33+) use standard UPDATE...FROM syntax
-                            where_cond = " AND ".join(f'"{collection}"."{k}" = src."{k}"' for k in keys)
-                            update_set = ", ".join(f'"{c}" = src."{c}"' for c in non_keys)
-                            
-                            update_sql = f"""
-                                UPDATE "{collection}"
-                                SET {update_set}
-                                FROM "{staging}" AS src
-                                WHERE {where_cond}
-                            """
-                            conn.execute(text(update_sql))
-
-                    # 4. Insert net-new records (bypassed for MSSQL)
-                    col_str = ", ".join(f'"{c}"' for c in columns)
-                    src_col_str = ", ".join(f'src."{c}"' for c in columns)
-                    join_cond = " AND ".join(f'dest."{k}" = src."{k}"' for k in keys)
-                    
-                    insert_sql = f"""
-                        INSERT INTO "{collection}" ({col_str})
-                        SELECT {src_col_str}
-                        FROM "{staging}" AS src
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM "{collection}" AS dest WHERE {join_cond}
-                        )
-                    """
-                    conn.execute(text(insert_sql))
-                    
-                finally:
-                    # 5. Clean up staging table
-                    if self.backend == "access":
-                        try:
-                            conn.execute(text(f'DROP TABLE "{staging}"'))
-                        except Exception:
-                            pass
-                    else:
-                        conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
+        if not keys:
+            raise AdapterError(f"resource '{self.name}': upsert into '{collection}' requires a key")
+        inspector = sa_inspect(self.engine)
+        with self.engine.begin() as conn:
+            if not inspector.has_table(collection):
+                frame.to_sql(collection, conn, if_exists="append",
+                             index=False, chunksize=chunksize, method="multi")
+                return
+            staging = f"__pipeplan_stage_{collection}"
+            frame.to_sql(staging, conn, if_exists="replace",
+                         index=False, chunksize=chunksize, method="multi")
+            try:
+                join = " AND ".join(f'"{collection}"."{k}" = src."{k}"' for k in keys)
+                conn.execute(text(
+                    f'DELETE FROM "{collection}" '
+                    f'WHERE EXISTS (SELECT 1 FROM "{staging}" AS src WHERE {join})'
+                ))
+                conn.execute(text(f'INSERT INTO "{collection}" SELECT * FROM "{staging}"'))
+            finally:
+                conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
 
     # -- delete ------------------------------------------------------------ #
 

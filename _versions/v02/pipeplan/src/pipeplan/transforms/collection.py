@@ -2,10 +2,10 @@
 
 Two orthogonal axes of combination, each a single, clearly-named operation:
 
-* **Horizontal** -- ``join``: widen records by attaching
+* **Horizontal** -- ``join`` (alias ``merge``): widen records by attaching
   attributes from another frame, matched on key(s). Wraps a vectorised
   ``pd.merge`` with the usual ``how`` strategies.
-* **Vertical** -- ``union``: lengthen a frame by
+* **Vertical** -- ``concat`` (aliases ``append``, ``union``): lengthen a frame by
   stacking the records of several frames that share a schema.
 
 ``fuzzy_join`` is a specialised horizontal join on approximate string keys.
@@ -57,6 +57,8 @@ class JoinTransform(Transform):
     records": every left record is kept and gains the matched right columns.
     Use ``inner`` to keep only matches, ``outer`` for a full union of keys,
     ``right`` to keep all right records, or ``cross`` for a cartesian product.
+
+    ``merge`` is registered as a synonym for this same operation.
     """
 
     tier: ClassVar[Tier] = Tier.COLLECTION
@@ -89,13 +91,17 @@ class JoinTransform(Transform):
             raise TransformError(f"join failed: {exc}") from exc
 
 
+# `merge` is the same horizontal operation under a familiar name.
+TRANSFORMS.register("merge", JoinTransform)
+
+
 # --------------------------------------------------------------------------- #
-# union  (vertical: add records under shared attributes)  aliases: append, concat
+# concat  (vertical: add records under shared attributes)  aliases: append, union
 # --------------------------------------------------------------------------- #
 
 
-@register_transform("union")
-class UnionTransform(Transform):
+@register_transform("concat")
+class ConcatTransform(Transform):
     """Combine frames *vertically*: stack their records into one longer frame.
 
     Each entry in ``frames`` is a state dataframe name or the ``${pipe}`` token.
@@ -107,6 +113,8 @@ class UnionTransform(Transform):
       append guaranteeing no NA is introduced by misaligned schemas).
 
     With ``dedupe: true`` exact-duplicate rows are collapsed after stacking.
+
+    ``append`` and ``union`` are registered as synonyms for this operation.
     """
 
     tier: ClassVar[Tier] = Tier.COLLECTION
@@ -117,13 +125,13 @@ class UnionTransform(Transform):
 
     def apply(self, df: pd.DataFrame | None, ctx: ExecutionContext) -> pd.DataFrame:
         if not self.frames:
-            raise TransformError("union requires at least one frame")
+            raise TransformError("concat requires at least one frame")
         resolved = [_resolve(name, df, ctx, "frames") for name in self.frames]
 
         if self.columns == "inner":
             common = set.intersection(*(set(f.columns) for f in resolved))
             if not common:
-                raise TransformError("union columns='inner' but the frames share no columns")
+                raise TransformError("concat columns='inner' but the frames share no columns")
             ordered = [c for c in resolved[0].columns if c in common]
             resolved = [f[ordered] for f in resolved]
 
@@ -131,6 +139,11 @@ class UnionTransform(Transform):
         if self.dedupe:
             out = out.drop_duplicates().reset_index(drop=True)
         return out
+
+
+# Familiar synonyms for the same vertical operation.
+TRANSFORMS.register("append", ConcatTransform)
+TRANSFORMS.register("union", ConcatTransform)
 
 
 # --------------------------------------------------------------------------- #

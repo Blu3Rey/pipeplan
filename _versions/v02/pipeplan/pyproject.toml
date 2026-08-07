@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipeplan"
+version = "1.0.0"
+description = "A declarative, configuration-driven batch ETL framework on pandas."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "PipePlan" }]
+keywords = ["etl", "pandas", "pipeline", "declarative", "data-engineering"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "pandas>=2.0",
+    "pydantic>=2.5",
+    "sqlalchemy>=2.0",
+    "python-dateutil>=2.8",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Excel/parquet file support.
+files = ["openpyxl>=3.1", "pyarrow>=14.0"]
+# Database drivers. Access additionally needs the OS-level ODBC driver.
+postgres = ["psycopg2-binary>=2.9"]
+access = ["pyodbc>=5.0", "sqlalchemy-access>=2.0"]
+mysql = ["pymysql>=1.1"]
+# High-performance fuzzy matching (falls back to stdlib difflib without it).
+fuzzy = ["rapidfuzz>=3.0"]
+# Everything for local development and the test-suite.
+dev = [
+    "openpyxl>=3.1",
+    "pyarrow>=14.0",
+    "rapidfuzz>=3.0",
+    "pytest>=7.0",
+]
+
+[project.scripts]
+pipeplan = "pipeplan.cli:main"
+
+# --------------------------------------------------------------------------- #
+# Extensibility: third-party packages contribute transforms / expressions by
+# declaring entry points in these groups. The core never imports them directly.
+# --------------------------------------------------------------------------- #
+[project.entry-points."pipeplan.transforms"]
+# example_action = "your_package.module:YourTransform"
+
+[project.entry-points."pipeplan.expressions"]
+# geodistance = "your_package.module:geodistance"
+
+[project.entry-points."pipeplan.notifiers"]
+# slack = "your_package.module:make_slack_notifier"
+
+[project.entry-points."pipeplan.secret_providers"]
+# vault = "your_package.module:make_vault_provider"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipeplan"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
