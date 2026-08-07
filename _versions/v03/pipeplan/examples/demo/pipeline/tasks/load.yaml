@@ -1,0 +1,31 @@
+tasks:
+  load_warehouse:
+    stage: load
+    resource: warehouse
+    depends_on: [finalize_orders, region_rollup, rank_orders, normalize_customers]
+    steps:
+      - input: orders_final
+        collection: fact_orders
+        mode: replace
+        input_contract: orders_final
+        write:
+          partition_by: [order_date]
+          chunksize: 50000
+
+      - input: orders_ranked
+        collection: fact_orders_ranked
+        mode: replace
+
+      - input: region_summary
+        collection: dim_region_summary
+        mode: replace
+
+      - input: customers_clean
+        collection: dim_customer
+        mode: scd2
+        key: [cust_id]
+        scd:
+          track: [cust_name, region_code]
+          effective_from: valid_from
+          effective_to: valid_to
+          current_flag: is_current

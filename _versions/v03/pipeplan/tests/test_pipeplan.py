@@ -261,23 +261,175 @@ def test_merge_with_pipe_and_state():
     st.set("right", pd.DataFrame({"k": [1, 2], "name": ["a", "b"]}))
     ctx = _ctx(st)
     left = pd.DataFrame({"k": [1, 2], "v": [10, 20]})
-    out = build_transform("join", {"left": "${pipe}", "right": "right", "how": "left", "on": "k"}).apply(left, ctx)
+    out = build_transform("merge", {"left": "${pipe}", "right": "right", "how": "left", "on": "k"}).apply(left, ctx)
     assert out["name"].tolist() == ["a", "b"]
 
 
 def test_pipe_without_flow_errors():
     with pytest.raises(TransformError):
-        build_transform("join", {"left": "${pipe}", "right": "x", "on": "k"}).apply(None, _ctx())
+        build_transform("merge", {"left": "${pipe}", "right": "x", "on": "k"}).apply(None, _ctx())
 
 
-def test_union():
+def test_join_horizontal_default_left():
+    # join (canonical) defaults to a left join: every left record kept + widened.
     st = StateManager()
-    st.set("other", pd.DataFrame({"a": [3]}))
-    ctx = _ctx(st)
-    out = build_transform("union", {"frames": ["${pipe}", "other"], "dedupe": True}).apply(
-        pd.DataFrame({"a": [1, 3]}), ctx
+    st.set("right", pd.DataFrame({"k": [1], "name": ["a"]}))
+    out = build_transform("join", {"left": "${pipe}", "right": "right", "on": "k"}).apply(
+        pd.DataFrame({"k": [1, 2], "v": [10, 20]}), _ctx(st)
+    )
+    assert len(out) == 2  # left-preserving
+    assert out.loc[out["k"] == 2, "name"].isna().all()
+
+
+def test_merge_is_alias_of_join():
+    from pipeplan.core.registry import TRANSFORMS
+    assert TRANSFORMS.get("merge") is TRANSFORMS.get("join")
+
+
+def test_concat_vertical_outer_columns():
+    st = StateManager()
+    st.set("b", pd.DataFrame({"a": [3], "extra": ["z"]}))  # differing schema
+    out = build_transform("concat", {"frames": ["${pipe}", "b"], "columns": "outer"}).apply(
+        pd.DataFrame({"a": [1]}), _ctx(st)
     )
     assert sorted(out["a"].tolist()) == [1, 3]
+    assert "extra" in out.columns                 # outer keeps all columns
+    assert out.loc[out["a"] == 1, "extra"].isna().all()
+
+
+def test_concat_dedupe_collapses_exact_duplicates():
+    st = StateManager()
+    st.set("other", pd.DataFrame({"a": [3]}))
+    out = build_transform("concat", {"frames": ["${pipe}", "other"], "dedupe": True}).apply(
+        pd.DataFrame({"a": [1, 3]}), _ctx(st)
+    )
+    assert sorted(out["a"].tolist()) == [1, 3]    # the duplicate 3 is collapsed
+
+
+def test_concat_inner_aligns_common_columns():
+    st = StateManager()
+    st.set("b", pd.DataFrame({"a": [3], "extra": ["z"]}))
+    out = build_transform("concat", {"frames": ["${pipe}", "b"], "columns": "inner"}).apply(
+        pd.DataFrame({"a": [1]}), _ctx(st)
+    )
+    assert list(out.columns) == ["a"]
+
+
+def test_append_and_union_are_aliases_of_concat():
+    from pipeplan.core.registry import TRANSFORMS
+    assert TRANSFORMS.get("append") is TRANSFORMS.get("concat")
+    assert TRANSFORMS.get("union") is TRANSFORMS.get("concat")
+
+
+# --------------------------------------------------------------------------- #
+# ${pipe:col} runtime column interpolation (reducer disambiguates shape)
+# --------------------------------------------------------------------------- #
+
+
+def _pipe_df():
+    return pd.DataFrame({"id": [1, 2, 3, 4], "amount": [10.0, 50.0, 30.0, 90.0]})
+
+
+def test_pipe_filter_scalar_reducer():
+    # amount >= mean(amount)=45  -> keeps 50 and 90
+    out = _apply("filter", {"amount": {"op": ">=", "value": "${pipe:amount|mean}"}}, _pipe_df())
+    assert sorted(out["amount"].tolist()) == [50.0, 90.0]
+
+
+def test_pipe_filter_list_reducer():
+    out = _apply("filter", {"id": {"op": "in", "value": "${pipe:id|unique}"}}, _pipe_df())
+    assert len(out) == 4
+
+
+def test_pipe_filter_elementwise_column():
+    # amount > id, compared row-wise (bare column -> aligned Series)
+    out = _apply("filter", {"amount": {"op": ">", "value": "${pipe:id}"}}, _pipe_df())
+    assert len(out) == 4
+
+
+def test_pipe_derive_reducer_node():
+    out = _apply("derive", {"target": "share", "expr": {"/": [{"col": "amount"}, {"pipe": "amount|sum"}]}}, _pipe_df())
+    assert round(out["share"].sum(), 6) == 1.0
+
+
+def test_pipe_fillna_aggregate():
+    df = pd.DataFrame({"amount": [10.0, None, 30.0, None]})
+    out = _apply("fillna", {"amount": "${pipe:amount|median}"}, df)
+    assert out["amount"].tolist() == [10.0, 20.0, 30.0, 20.0]
+
+
+def test_pipe_unknown_reducer_errors():
+    from pipeplan.core.exceptions import ExpressionError
+    with pytest.raises(ExpressionError):
+        _apply("filter", {"amount": {"op": ">", "value": "${pipe:amount|bogus}"}}, _pipe_df())
+
+
+def test_pipe_token_survives_strict_load():
+    cfg = load_config(
+        {
+            "metadata": {"id": "p"},
+            "resources": {"r": {"adapter": "db", "params": {"engine": "sqlite", "path": "/tmp/x"}}},
+            "tasks": {
+                "src": {"stage": "extract", "resource": "r", "steps": [{"collection": "t", "output": "a"}]},
+                "t": {"stage": "transform", "input": "a", "output": "b",
+                      "steps": [{"action": "filter", "with": {"amount": {"op": ">=", "value": "${pipe:amount|mean}"}}}]},
+            },
+        },
+        strict=True,
+    )
+    # 'pipe' is a deferred namespace: the token is preserved for runtime, not
+    # consumed or errored by strict load-time interpolation.
+    assert cfg.tasks["t"].steps[0].with_["amount"]["value"] == "${pipe:amount|mean}"
+
+
+# --------------------------------------------------------------------------- #
+# ${pipe:column} runtime operand (horizontal aligned vs vertical reduced)
+# --------------------------------------------------------------------------- #
+
+
+def test_pipe_column_horizontal_aligned():
+    df = pd.DataFrame({"amount": [100, 200, 50], "cost": [120, 150, 40]})
+    out = build_transform("filter", {"column": "amount", "op": ">", "value": "${pipe:cost}"}).apply(df, _ctx())
+    assert out["amount"].tolist() == [200, 50]   # element-wise column vs column
+
+
+def test_pipe_column_vertical_reducer_scalar():
+    df = pd.DataFrame({"amount": [100, 200, 300, 50]})  # mean = 162.5
+    out = build_transform("filter", {"column": "amount", "op": ">=", "value": "${pipe:amount|mean}"}).apply(df, _ctx())
+    assert out["amount"].tolist() == [200, 300]
+
+
+def test_pipe_column_vertical_membership():
+    st = StateManager()
+    df = pd.DataFrame({"id": [1, 2, 3, 4], "keep": [1, 1, 0, 0]})
+    # membership against the unique values of another column of the same frame
+    out = build_transform("filter", {"column": "id", "op": "in", "value": "${pipe:id|unique}"}).apply(df, _ctx(st))
+    assert len(out) == 4
+
+
+def test_pipe_column_in_derive_expression():
+    df = pd.DataFrame({"amount": [100, 200, 300, 50]})  # mean = 162.5
+    out = build_transform("derive", {"target": "dev", "expr": {"-": [{"col": "amount"}, {"pipe": "amount|mean"}]}}).apply(df, _ctx())
+    assert out["dev"].tolist() == [-62.5, 37.5, 137.5, -112.5]
+
+
+def test_pipe_token_survives_strict_load():
+    cfg = load_config({
+        "metadata": {"id": "p"},
+        "resources": {"r": {"adapter": "file", "params": {"format": "csv", "path": "/tmp/x.csv"}, "allow": ["read"]}},
+        "tasks": {
+            "e": {"stage": "extract", "resource": "r", "steps": [{"output": "a"}]},
+            "t": {"stage": "transform", "input": "a", "output": "b",
+                  "steps": [{"action": "filter", "with": {"column": "amount", "op": ">=", "value": "${pipe:amount|mean}"}}]},
+        },
+    }, strict=True)
+    assert cfg.tasks["t"].steps[0].with_["value"] == "${pipe:amount|mean}"
+
+
+def test_pipe_unknown_reducer_errors():
+    df = pd.DataFrame({"a": [1, 2]})
+    with pytest.raises(Exception):
+        build_transform("filter", {"column": "a", "op": ">=", "value": "${pipe:a|bogus}"}).apply(df, _ctx())
 
 
 # --------------------------------------------------------------------------- #
@@ -429,3 +581,160 @@ def test_on_failure_skip(tmp_path: Path):
     run_pipeline(cfg)  # tr fails, skipped; ld still loads raw
     out = pd.read_sql('SELECT * FROM "fact"', sqlite3.connect(tmp_path / "o.db"))
     assert len(out) == 3
+
+
+# --------------------------------------------------------------------------- #
+# load phase: atomicity, DDL, metrics, deferred watermark, guards
+# --------------------------------------------------------------------------- #
+
+
+def _db(tmp_path, name="w.db", allow=("read", "write")):
+    res = ResourceConfig.model_validate({
+        "name": "w", "adapter": "db", "allow": list(allow),
+        "params": {"engine": "sqlite", "path": str(tmp_path / name)},
+    })
+    return create_adapter(res)
+
+
+def test_load_batch_is_atomic(tmp_path):
+    from pipeplan.adapters.base import WriteRequest
+    a = _db(tmp_path)
+    good = WriteRequest(pd.DataFrame({"k": [1]}), "t1", LoadMode.REPLACE)
+    bad = WriteRequest(pd.DataFrame({"k": [1]}), "t2", LoadMode.SCD2, key=[])  # invalid -> raises
+    with pytest.raises(Exception):
+        a.write_batch([good, bad])
+    # first request must have rolled back -> t1 never created
+    assert not a.has_table("t1")
+    a.dispose()
+
+
+def test_replace_preserves_schema(tmp_path):
+    a = _db(tmp_path)
+    contract = DataframeContract.model_validate({
+        "primary_key": ["id"],
+        "columns": {"id": {"dtype": "integer", "nullable": False},
+                    "name": {"dtype": "string"}},
+    })
+    a.write(pd.DataFrame({"id": [1, 2], "name": ["a", "b"]}), "dim", mode=LoadMode.REPLACE, contract=contract)
+    from sqlalchemy import inspect as sa_inspect
+    pk_before = sa_inspect(a.engine).get_pk_constraint("dim")["constrained_columns"]
+    # replace again: table must be truncated+reloaded, NOT dropped -> PK survives
+    a.write(pd.DataFrame({"id": [3], "name": ["c"]}), "dim", mode=LoadMode.REPLACE, contract=contract)
+    pk_after = sa_inspect(a.engine).get_pk_constraint("dim")["constrained_columns"]
+    assert pk_before == pk_after == ["id"]
+    assert a.read("dim")["id"].tolist() == [3]
+    a.dispose()
+
+
+def test_contract_driven_ddl_types(tmp_path):
+    a = _db(tmp_path)
+    contract = DataframeContract.model_validate({
+        "columns": {"id": {"dtype": "integer"}, "amt": {"dtype": "float"}, "label": {"dtype": "string"}},
+    })
+    a.write(pd.DataFrame({"id": [1], "amt": [1.5], "label": ["x"]}), "typed", mode=LoadMode.REPLACE, contract=contract)
+    from sqlalchemy import inspect as sa_inspect
+    types = {c["name"]: str(c["type"]).upper() for c in sa_inspect(a.engine).get_columns("typed")}
+    assert "INT" in types["id"] or "BIGINT" in types["id"]
+    assert "FLOAT" in types["amt"] or "REAL" in types["amt"]
+    assert "TEXT" in types["label"] or "VARCHAR" in types["label"]
+    a.dispose()
+
+
+def test_upsert_uses_explicit_columns_regardless_of_order(tmp_path):
+    a = _db(tmp_path)
+    a.write(pd.DataFrame({"k": [1, 2], "a": [10, 20], "b": ["x", "y"]}), "t", mode=LoadMode.REPLACE)
+    # incoming frame has columns in a different order than the target
+    reordered = pd.DataFrame({"b": ["Z"], "k": [2], "a": [99]})
+    a.write(reordered, "t", mode=LoadMode.UPSERT, key=["k"])
+    got = a.read("t").sort_values("k").set_index("k")
+    assert got.loc[2, "a"] == 99 and got.loc[2, "b"] == "Z"   # not misaligned
+    assert got.loc[1, "a"] == 10
+    a.dispose()
+
+
+def test_load_result_metrics(tmp_path):
+    a = _db(tmp_path)
+    r1 = a.write(pd.DataFrame({"k": [1, 2]}), "t", mode=LoadMode.REPLACE)
+    assert r1.inserted == 2 and r1.created_table
+    a.write(pd.DataFrame({"k": [2, 3]}), "t", mode=LoadMode.UPSERT, key=["k"])
+    r3 = a.write(pd.DataFrame({"k": [3]}), "t", mode=LoadMode.DELETE, key=["k"])
+    assert r3.deleted == 1
+    a.dispose()
+
+
+def test_file_upsert_is_rejected_not_silently_replaced(tmp_path):
+    res = ResourceConfig.model_validate({"name": "r", "adapter": "file",
+                                         "params": {"format": "csv", "path": str(tmp_path / "x.csv")}})
+    a = create_adapter(res)
+    a.write(pd.DataFrame({"k": [1], "v": [1]}), "x", mode=LoadMode.REPLACE)
+    with pytest.raises(Exception):
+        a.write(pd.DataFrame({"k": [1], "v": [9]}), "x", mode=LoadMode.UPSERT, key=["k"])
+
+
+def test_partition_by_only_with_replace_rejected():
+    with pytest.raises(ConfigError):
+        load_config({
+            "metadata": {"id": "p"},
+            "resources": {"w": {"adapter": "db", "params": {"engine": "sqlite", "path": "/tmp/x"}}},
+            "tasks": {
+                "t": {"stage": "transform", "input": "src", "output": "o",
+                      "steps": [{"action": "sort", "with": {"k": "asc"}}]},
+                "l": {"stage": "load", "resource": "w",
+                      "steps": [{"input": "o", "collection": "c", "mode": "append",
+                                 "write": {"partition_by": ["d"]}}]},
+                "e": {"stage": "extract", "resource": "w", "steps": [{"collection": "s", "output": "src"}]},
+            },
+        })
+
+
+def _incremental_cfg(tmp_path, load_allow):
+    # source db with a cursor column; warehouse with a watermark store.
+    src = tmp_path / "src.db"
+    import sqlalchemy as sa
+    eng = sa.create_engine(f"sqlite:///{src}")
+    pd.DataFrame({"k": [1, 2], "updated_at": ["2026-01-02", "2026-01-03"]}).to_sql(
+        "events", eng, index=False)
+    eng.dispose()
+    return {
+        "metadata": {"id": "wm"},
+        "resources": {
+            "source": {"adapter": "db", "params": {"engine": "sqlite", "path": str(src)}, "allow": ["read"]},
+            "wh": {"adapter": "db", "params": {"engine": "sqlite", "path": str(tmp_path / "wh.db")},
+                   "allow": list(load_allow)},
+        },
+        "orchestration": {"watermark_store": {"resource": "wh", "table": "pipeplan_watermarks"}},
+        "tasks": {
+            "ext": {"stage": "extract", "resource": "source",
+                    "incremental": {"strategy": "watermark", "cursor": "updated_at", "initial": "2026-01-01"},
+                    "steps": [{"collection": "events", "output": "raw"}]},
+            "ld": {"stage": "load", "resource": "wh",
+                   "steps": [{"input": "raw", "collection": "fact", "mode": "append"}]},
+        },
+    }
+
+
+def test_watermark_not_advanced_when_load_fails(tmp_path):
+    # load resource is read-only -> the load raises -> watermark must NOT advance
+    cfg = load_config(_incremental_cfg(tmp_path, load_allow=["read"]))
+    with pytest.raises(Exception):
+        run_pipeline(cfg)
+    wh = sqlite3.connect(tmp_path / "wh.db")
+    try:
+        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", wh)["name"].tolist()
+        rows = 0
+        if "pipeplan_watermarks" in tables:
+            rows = int(pd.read_sql('SELECT COUNT(*) n FROM pipeplan_watermarks', wh)["n"][0])
+        assert rows == 0
+    finally:
+        wh.close()
+
+
+def test_watermark_advanced_after_successful_load(tmp_path):
+    cfg = load_config(_incremental_cfg(tmp_path, load_allow=["read", "write"]))
+    run_pipeline(cfg)
+    wh = sqlite3.connect(tmp_path / "wh.db")
+    try:
+        val = pd.read_sql('SELECT value FROM pipeplan_watermarks', wh)["value"].tolist()
+        assert val == ["2026-01-03"]
+    finally:
+        wh.close()

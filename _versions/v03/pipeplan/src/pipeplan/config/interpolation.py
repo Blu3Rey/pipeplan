@@ -57,7 +57,7 @@ def resolve(
 
 def _lookup(ns: str, ref: str, resolvers: Mapping[str, Resolver], *, strict: bool) -> Any:
     if ns in _DEFERRED_NAMESPACES:
-        return _MISSING # leave the token intact for runtime resolution
+        return _MISSING  # leave the token intact for runtime resolution
     resolver = resolvers.get(ns)
     if resolver is None:
         if strict:
