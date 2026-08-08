@@ -240,6 +240,11 @@ class LoadStep(StrictModel):
             raise ValueError("load mode 'scd2' requires an 'scd' block (track columns)")
         if self.mode is not LoadMode.SCD2 and self.scd is not None:
             raise ValueError("'scd' block is only valid with mode 'scd2'")
+        if self.write.partition_by and self.mode is not LoadMode.REPLACE:
+            raise ValueError(
+                f"write.partition_by is only supported with mode 'replace', "
+                f"not '{self.mode.value}'"
+            )
         return self
 
 

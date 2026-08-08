@@ -51,9 +51,11 @@ _SCALAR_REDUCERS: dict[str, Callable[[pd.Series], Any]] = {
     "last": lambda s: s.iloc[-1] if len(s) else None,
 }
 
+
 def is_pipe_ref(value: Any) -> bool:
     """True if ``value`` is a ``${pipe...}`` token string."""
     return isinstance(value, str) and _PIPE_RE.match(value) is not None
+
 
 def resolve_pipe_token(token: str, df: pd.DataFrame) -> Any:
     """Resolve a full ``${pipe:col|reducer}`` token against ``df``."""
@@ -67,6 +69,7 @@ def resolve_pipe_token(token: str, df: pd.DataFrame) -> Any:
             "(optionally ${pipe:column|reducer}) to reference a column's values"
         )
     return resolve_pipe_ref(ref, df)
+
 
 def resolve_pipe_ref(ref: str, df: pd.DataFrame) -> Any:
     """Resolve the inner ``col`` or ``col|reducer`` reference against ``df``."""

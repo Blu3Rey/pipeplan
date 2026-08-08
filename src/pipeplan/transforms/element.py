@@ -315,11 +315,16 @@ class DeriveTransform(Transform):
 
 @register_transform("fillna")
 class FillNaTransform(_ColumnMapped):
-    """Fill missing values per column with a constant.
+    """Fill missing values per column with a constant or a pipe-derived value.
 
     Columns named here that are absent from the frame are created and filled,
     which makes a downstream contract's ``nullable: false`` satisfiable for an
     optional upstream field.
+
+    A value may be a literal, or a runtime ``${pipe:col|reducer}`` token
+    resolved against the flowing frame -- e.g. median imputation::
+
+        fillna: { amount: "${pipe:amount|median}" }
     """
 
     tier: ClassVar[Tier] = Tier.ELEMENT
@@ -327,7 +332,17 @@ class FillNaTransform(_ColumnMapped):
 
     def apply(self, df: pd.DataFrame | None, ctx: ExecutionContext) -> pd.DataFrame:
         assert df is not None
+        from ..core.pipe import is_pipe_ref, resolve_pipe_token
+
         for column, value in self.columns.items():
+            if is_pipe_ref(value):
+                value = resolve_pipe_token(value, df)
+                # Removed check as it prevented filling empties with that of another column
+                # if isinstance(value, pd.Series):
+                #     raise TransformError(
+                #         f"fillna['{column}']: a bare ${{pipe:col}} resolves to a column; "
+                #         f"add a reducer (e.g. ${{pipe:{column}|median}}) for a fill value"
+                #     )
             if column in df.columns:
                 df[column] = df[column].fillna(value)
             else:
