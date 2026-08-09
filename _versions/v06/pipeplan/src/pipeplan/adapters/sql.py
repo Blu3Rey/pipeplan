@@ -174,8 +174,6 @@ class SqlLoadTarget:
 
     def drop(self, table: str) -> None:
         self.conn.execute(text(f"DROP TABLE IF EXISTS {self.q(table)}"))
-        # if self.has_table(table):
-        #     self.conn.execute(text(f"DROP TABLE {self.q(table)}"))
 
     # -- data ------------------------------------------------------------- #
 
