@@ -8,6 +8,7 @@ row-by-row Python and no ``DataFrame.apply``; all work goes through the pandas
 from __future__ import annotations
 
 import re
+import html
 from typing import Any, ClassVar, Literal
 
 import pandas as pd
@@ -224,6 +225,26 @@ class CastTransform(_ColumnMapped):
 
 
 # --------------------------------------------------------------------------- #
+# round
+# --------------------------------------------------------------------------- #
+
+
+@register_transform("round")
+class RoundTransform(_ColumnMapped):
+    """Round numerical values to a specified number of decimal places."""
+
+    tier: ClassVar[Tier] = Tier.ELEMENT
+    columns: dict[str, int]
+
+    def apply(self, df: pd.DataFrame | None, ctx: ExecutionContext) -> pd.DataFrame:
+        assert df is not None
+        _require_columns(df, list(self.columns), "round")
+        for column, dp in self.columns.items():
+            df[column] = df[column].round(dp)
+        return df
+
+
+# --------------------------------------------------------------------------- #
 # affix
 # --------------------------------------------------------------------------- #
 
@@ -261,6 +282,7 @@ NormOp = Literal[
     "nfc", "nfkc", "nfd", "nfkd",
     "strip", "lstrip", "rstrip",
     "upper", "lower", "title", "casefold",
+    "unicode_unescape", "html_unescape"
 ]
 
 
@@ -268,6 +290,18 @@ def _apply_norm(series: pd.Series, op: str) -> pd.Series:
     text = series.astype("string")
     if op in ("nfc", "nfkc", "nfd", "nfkd"):
         return text.str.normalize(op.upper())
+
+    if op == "unicode_unescape":
+        # Safely target only literal \uXXXX or \UXXXXXXXX escape patterns
+        return text.str.replace(
+            r'\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}',
+            lambda match: match.group(0).encode('utf-8').decode('unicode_escape'),
+            regex=True
+        )
+
+    if op == "html_unescape":
+        return text.map(lambda x: html.unescape(x) if pd.notna(x) else x)
+    
     return getattr(text.str, op)()
 
 
