@@ -1,0 +1,7 @@
+vars:
+  min_order_amount: 0
+  high_value_threshold: 500
+  status_decode:
+    C: completed
+    P: pending
+    X: cancelled

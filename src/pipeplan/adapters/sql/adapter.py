@@ -21,12 +21,12 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect as sa_inspect, text
 from sqlalchemy.engine import Engine
 
-from ..config.models import Permission, ResourceConfig
-from ..core.exceptions import AdapterError
-from ..core.registry import LOAD_STRATEGIES
-from . import load_strategies as _load_strategies  # noqa: F401  (registers strategies)
-from .base import Adapter, LoadResult, WriteRequest
-from .sql import SqlLoadTarget
+from ...config.models import Permission, ResourceConfig
+from ...core.exceptions import AdapterError
+from ...core.registry import LOAD_STRATEGIES, register_adapter
+from . import strategies as _load_strategies  # noqa: F401  (registers strategies)
+from ..base import Adapter, LoadResult, WriteRequest
+from .target import SqlLoadTarget
 
 # Python 3.12 deprecates sqlite3's default datetime adapters; register explicit
 # ISO adapters so date/datetime writes stay clean and unambiguous.
@@ -63,6 +63,7 @@ def _enable_sqlite_transactional_ddl(engine: Engine) -> None:
         conn.exec_driver_sql("BEGIN")
 
 
+@register_adapter("db")
 class DBAdapter(Adapter):
     """Read and write dataframes to a relational database via SQLAlchemy."""
 

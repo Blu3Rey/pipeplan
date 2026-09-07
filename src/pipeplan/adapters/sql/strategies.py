@@ -18,10 +18,10 @@ from abc import ABC, abstractmethod
 
 import pandas as pd
 
-from ..core.exceptions import AdapterError
-from ..core.registry import register_load_strategy
-from .base import LoadResult, WriteRequest
-from .sql import SqlLoadTarget
+from ...core.exceptions import AdapterError
+from ...core.registry import register_load_strategy
+from ..base import LoadResult, WriteRequest
+from .target import SqlLoadTarget
 
 
 class LoadStrategy(ABC):

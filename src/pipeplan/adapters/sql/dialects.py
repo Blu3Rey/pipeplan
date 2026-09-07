@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from ..core.registry import SQL_DIALECTS, register_sql_dialect
+from ...core.registry import SQL_DIALECTS, register_sql_dialect
 
 Quote = Callable[[str], str]
 

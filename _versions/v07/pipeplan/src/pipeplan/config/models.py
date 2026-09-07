@@ -414,15 +414,16 @@ class PipelineConfig(StrictModel):
                 )
 
     def _check_pipe_usage(self) -> None:
+        vertical = {"concat", "append", "union"}
         for name, task in self.tasks.items():
             if not isinstance(task, TransformTask):
                 continue
             for step in task.steps:
-                if step.action == "union":
+                if step.action in vertical:
                     frames = step.with_.get("frames") if isinstance(step.with_, dict) else None
                     if not isinstance(frames, list) or not frames:
                         raise ValueError(
-                            f"task '{name}': union requires a non-empty 'frames' list"
+                            f"task '{name}': '{step.action}' requires a non-empty 'frames' list"
                         )
 
     # -- dataframe graph helpers ------------------------------------------ #
