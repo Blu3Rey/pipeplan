@@ -1,0 +1,375 @@
+"""REST API resource adapter.
+
+Treats a REST API as a resource: GET endpoints extract into DataFrames; the load
+modes map to HTTP verbs (``append``->POST create, ``upsert``->PATCH/PUT by key
+with POST fallback, ``delete``->DELETE by key). ``replace`` is refused unless an
+endpoint explicitly declares a ``replace`` operation (destructive over REST), and
+``scd2`` is rejected (relational-only).
+
+Safety comes from the declarative endpoint map (see :mod:`.config`): only declared
+operations are callable, each with a pinned method and a path template rooted at
+``base_url`` -- an unmapped URL or an accidental destructive verb is impossible.
+The resource's ``allow`` list still gates read vs write; a ``dry_run`` flag logs
+intended calls without sending; writes carry an idempotency key so retries can't
+double-create.
+
+Networking is behind an injectable :class:`~.transport.Transport`, so the whole
+adapter is testable without a live API.
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable
+
+import pandas as pd
+
+from ...config.models import LoadMode, Permission, ResourceConfig
+from ...core.durations import parse_seconds
+from ...core.exceptions import AdapterError, ConfigError
+from ...core.registry import register_adapter
+from .. import jsonutil
+from ..base import Adapter, LoadResult, WriteRequest
+from .config import Endpoint, Operation, RestConfig
+from .transport import RateLimiter, RequestsTransport, Response, Transport, send
+
+logger = logging.getLogger("pipeplan.rest")
+_IDEMPOTENCY_NS = uuid.UUID("6f4b1e26-1c2a-4c2e-9c7a-2b7a9a1d5e00")
+
+
+@register_adapter("rest")
+@register_adapter("http")
+class RestAdapter(Adapter):
+    """Extract from and load to a REST API via a declarative endpoint map."""
+
+    def __init__(self, config: ResourceConfig, transport: Transport | None = None) -> None:
+        super().__init__(config)
+        try:
+            self.rest = RestConfig.model_validate(config.params)
+        except Exception as exc:
+            raise ConfigError(f"resource '{self.name}': invalid REST config: {exc}") from exc
+        self._transport = transport
+        self._limiter: RateLimiter | None = None
+        if self.rest.rate_limit is not None:
+            self._limiter = RateLimiter(
+                self.rest.rate_limit.requests, parse_seconds(self.rest.rate_limit.per)
+            )
+        self._errlock = threading.Lock()
+
+    # ------------------------------------------------------------------ #
+    # wiring helpers
+    # ------------------------------------------------------------------ #
+
+    def _endpoint(self, collection: str | None) -> Endpoint:
+        if collection is None:
+            raise AdapterError(f"resource '{self.name}': a REST step must name an endpoint")
+        ep = self.rest.endpoints.get(collection)
+        if ep is None:
+            available = ", ".join(sorted(self.rest.endpoints)) or "<none>"
+            raise AdapterError(
+                f"resource '{self.name}': endpoint '{collection}' is not declared "
+                f"(declared: {available})"
+            )
+        return ep
+
+    def _url(self, path: str) -> str:
+        return self.rest.base_url + (path if path.startswith("/") else "/" + path)
+
+    def _fill(self, path: str, row: dict[str, Any], keys: list[str]) -> str:
+        out = path
+        for k in keys:
+            token = "{" + k + "}"
+            if token in out:
+                if k not in row or pd.isna(row.get(k)):
+                    raise AdapterError(f"resource '{self.name}': missing path key '{k}' for {path}")
+                out = out.replace(token, str(row[k]))
+        return self._url(out)
+
+    def _headers(self, *, write: bool, idempotency: str | None) -> dict[str, str]:
+        headers = dict(self.rest.headers)
+        auth = self.rest.auth
+        if auth.type == "bearer":
+            headers["Authorization"] = f"Bearer {auth.token}"
+        elif auth.type == "api_key" and not auth.param:
+            headers[auth.header] = auth.key or ""
+        elif auth.type == "basic":
+            raw = f"{auth.user}:{auth.password}".encode()
+            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode()
+        if write:
+            headers.setdefault("Content-Type", "application/json")
+        if idempotency:
+            headers[self.rest.idempotency_header] = idempotency
+        return headers
+
+    def _http(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any = None,
+        write: bool = False,
+        idempotency: str | None = None,
+    ) -> Response:
+        auth = self.rest.auth
+        if auth.type == "api_key" and auth.param:    # api key as a query param
+            params = {**(params or {}), auth.param: auth.key}
+        if self.rest.dry_run and write:
+            logger.info("[dry-run] %s %s body=%s", method, url, json)
+            return Response(200, None, {})
+        return send(
+            self._get_transport(), method, url,
+            headers=self._headers(write=write, idempotency=idempotency),
+            params=params, json=json, timeout=self.rest.timeout,
+            retry_attempts=self.rest.retry.attempts, retry_backoff=self.rest.retry.backoff,
+            retry_on=set(self.rest.retry.on_status), limiter=self._limiter,
+            label=f"{method} {url}",
+        )
+
+    def _get_transport(self) -> Transport:
+        if self._transport is None:
+            self._transport = RequestsTransport()
+        return self._transport
+
+    # ------------------------------------------------------------------ #
+    # read (with pagination)
+    # ------------------------------------------------------------------ #
+
+    def read(self, collection: str | None, *, since: tuple[str, Any] | None = None) -> pd.DataFrame:
+        self._require(Permission.READ)
+        ep = self._endpoint(collection)
+        op = ep.read
+        if op is None:
+            raise AdapterError(f"resource '{self.name}': endpoint '{collection}' has no 'read' op")
+        base_params: dict[str, Any] = {}
+        if since is not None and op.since_param and since[1] is not None:
+            base_params[op.since_param] = since[1]
+        records = self._paginate(op, base_params)
+        return jsonutil.to_frame(records)
+
+    def _paginate(self, op: Operation, base_params: dict[str, Any]) -> list[dict[str, Any]]:
+        pg = self.rest.pagination
+        url = self._url(op.path)
+        out: list[dict[str, Any]] = []
+
+        def fetch(url_, params_):
+            resp = self._http(op.method, url_, params=params_)
+            if not resp.ok:
+                raise AdapterError(f"resource '{self.name}': {op.method} {url_} -> "
+                                   f"{resp.status_code}: {str(resp.body)[:200]}")
+            return resp
+
+        if pg.style == "none":
+            out = jsonutil.extract_records(fetch(url, base_params).body, op.record_path)
+        elif pg.style == "page":
+            page = pg.start
+            for _ in range(pg.max_pages):
+                params = {**base_params, pg.param: page}
+                if pg.size_param and pg.size:
+                    params[pg.size_param] = pg.size
+                chunk = jsonutil.extract_records(fetch(url, params).body, op.record_path)
+                if not chunk:
+                    break
+                out += chunk
+                page += 1
+        elif pg.style == "offset":
+            offset, size = pg.start, (pg.size or 100)
+            for _ in range(pg.max_pages):
+                params = {**base_params, pg.param: offset}
+                if pg.size_param:
+                    params[pg.size_param] = size
+                chunk = jsonutil.extract_records(fetch(url, params).body, op.record_path)
+                if not chunk:
+                    break
+                out += chunk
+                offset += size
+                if len(chunk) < size:
+                    break
+        elif pg.style == "cursor":
+            cursor = None
+            for _ in range(pg.max_pages):
+                params = dict(base_params)
+                if cursor:
+                    params[pg.param] = cursor
+                resp = fetch(url, params)
+                out += jsonutil.extract_records(resp.body, op.record_path)
+                cursor = jsonutil.dig(resp.body, pg.next)
+                if not cursor:
+                    break
+        elif pg.style == "link":
+            next_url, params = url, base_params
+            for _ in range(pg.max_pages):
+                resp = fetch(next_url, params)
+                out += jsonutil.extract_records(resp.body, op.record_path)
+                next_url = _link_next(resp.headers)
+                params = None
+                if not next_url:
+                    break
+        return out
+
+    # ------------------------------------------------------------------ #
+    # write (mode -> verb)
+    # ------------------------------------------------------------------ #
+
+    def write_batch(self, requests: list[WriteRequest]) -> list[LoadResult]:
+        self._require(Permission.WRITE)
+        return [self._write_one(r) for r in requests]
+
+    def _write_one(self, req: WriteRequest) -> LoadResult:
+        ep = self._endpoint(req.collection)
+        mode = req.mode
+        if mode is LoadMode.SCD2:
+            raise AdapterError(
+                f"resource '{self.name}': the rest adapter does not support 'scd2'"
+            )
+        keys = ep.keys or req.key
+        if mode is LoadMode.APPEND:
+            fn = self._creator(req.collection, ep, keys)
+        elif mode is LoadMode.UPSERT:
+            fn = self._upserter(req.collection, ep, keys)
+        elif mode is LoadMode.DELETE:
+            fn = self._deleter(req.collection, ep, keys)
+        elif mode is LoadMode.REPLACE:
+            if ep.replace is None:
+                raise AdapterError(
+                    f"resource '{self.name}': mode 'replace' is refused for REST endpoint "
+                    f"'{req.collection}' (destructive); declare a 'replace' op to opt in"
+                )
+            fn = self._replacer(req.collection, ep, keys)
+        else:  # pragma: no cover - guarded by the enum
+            raise AdapterError(f"resource '{self.name}': unsupported mode '{mode}'")
+
+        counts = self._run(req.frame, fn)
+        return LoadResult(req.collection, mode.value, len(req.frame),
+                          inserted=counts["inserted"], updated=counts["updated"],
+                          deleted=counts["deleted"])
+
+    # -- per-record operation builders ------------------------------------ #
+
+    def _creator(self, collection, ep: Endpoint, keys) -> Callable[[dict], str]:
+        op = ep.create
+        if op is None:
+            raise AdapterError(f"resource '{self.name}': endpoint '{collection}' has no 'create' op")
+
+        def create(row: dict) -> str:
+            resp = self._http(op.method, self._fill(op.path, row, keys), write=True,
+                              json=jsonutil.to_document(row), idempotency=self._idem(collection, "create", row, keys))
+            self._ensure_ok(resp, op, collection)
+            return "inserted"
+        return create
+
+    def _upserter(self, collection, ep: Endpoint, keys) -> Callable[[dict], str]:
+        if not keys:
+            raise AdapterError(f"resource '{self.name}': upsert on '{collection}' requires a key")
+        update, create = ep.update, ep.create
+
+        def upsert(row: dict) -> str:
+            body = jsonutil.to_document(row)
+            if update is not None:
+                resp = self._http(update.method, self._fill(update.path, row, keys), write=True,
+                                  json=body, idempotency=self._idem(collection, "update", row, keys))
+                if resp.ok:
+                    return "updated"
+                if resp.status_code == 404 and create is not None:
+                    resp = self._http(create.method, self._fill(create.path, row, keys), write=True,
+                                      json=body, idempotency=self._idem(collection, "create", row, keys))
+                    self._ensure_ok(resp, create, collection)
+                    return "inserted"
+                self._ensure_ok(resp, update, collection)
+                return "updated"
+            if create is not None:
+                resp = self._http(create.method, self._fill(create.path, row, keys), write=True,
+                                  json=body, idempotency=self._idem(collection, "create", row, keys))
+                self._ensure_ok(resp, create, collection)
+                return "inserted"
+            raise AdapterError(f"resource '{self.name}': endpoint '{collection}' has no update/create op")
+        return upsert
+
+    def _deleter(self, collection, ep: Endpoint, keys) -> Callable[[dict], str]:
+        op = ep.delete
+        if op is None:
+            raise AdapterError(f"resource '{self.name}': endpoint '{collection}' has no 'delete' op")
+
+        def delete(row: dict) -> str:
+            resp = self._http(op.method, self._fill(op.path, row, keys), write=True)
+            if resp.status_code == 404:  # already absent -> idempotent success
+                return "deleted"
+            self._ensure_ok(resp, op, collection)
+            return "deleted"
+        return delete
+
+    def _replacer(self, collection, ep: Endpoint, keys) -> Callable[[dict], str]:
+        op = ep.replace
+
+        def replace(row: dict) -> str:
+            resp = self._http(op.method, self._fill(op.path, row, keys), write=True,
+                              json=jsonutil.to_document(row), idempotency=self._idem(collection, "replace", row, keys))
+            self._ensure_ok(resp, op, collection)
+            return "updated"
+        return replace
+
+    # -- execution / metrics ---------------------------------------------- #
+
+    def _run(self, frame: pd.DataFrame, fn: Callable[[dict], str]) -> dict[str, int]:
+        rows = frame.to_dict(orient="records")
+        counts = {"inserted": 0, "updated": 0, "deleted": 0}
+        errors: list[str] = []
+
+        def safe(row: dict) -> str | None:
+            try:
+                return fn(row)
+            except AdapterError as exc:
+                with self._errlock:
+                    errors.append(str(exc))
+                return None
+
+        if self.rest.concurrency == 1 or self.rest.dry_run or len(rows) <= 1:
+            results = [safe(r) for r in rows]
+        else:
+            with ThreadPoolExecutor(max_workers=self.rest.concurrency) as pool:
+                results = list(pool.map(safe, rows))
+
+        for kind in results:
+            if kind in counts:
+                counts[kind] += 1
+        if errors and not self.rest.continue_on_error:
+            raise AdapterError(
+                f"resource '{self.name}': {len(errors)} record(s) failed; first: {errors[0]}"
+            )
+        if errors:
+            logger.warning("resource '%s': %d record(s) failed (continue_on_error)", self.name, len(errors))
+        return counts
+
+    def _ensure_ok(self, resp: Response, op: Operation, collection: str) -> None:
+        if not resp.ok:
+            raise AdapterError(
+                f"resource '{self.name}': {op.method} on '{collection}' -> "
+                f"{resp.status_code}: {str(resp.body)[:200]}"
+            )
+
+    def _idem(self, collection: str, action: str, row: dict, keys: list[str]) -> str:
+        if keys and all(k in row for k in keys):
+            seed = collection + ":" + action + ":" + "|".join(str(row[k]) for k in keys)
+            return str(uuid.uuid5(_IDEMPOTENCY_NS, seed))
+        return str(uuid.uuid4())
+
+
+def _link_next(headers: dict[str, str] | None) -> str | None:
+    """Parse an RFC 5988 Link header for rel="next"."""
+    if not headers:
+        return None
+    link = headers.get("Link") or headers.get("link")
+    if not link:
+        return None
+    for part in link.split(","):
+        segments = part.split(";")
+        if len(segments) < 2:
+            continue
+        url = segments[0].strip().strip("<>")
+        if any('rel="next"' in s.replace(" ", "").replace("rel=next", 'rel="next"') for s in segments[1:]):
+            return url
+    return None

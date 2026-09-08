@@ -55,7 +55,7 @@ class DocumentAdapter(Adapter):
 
     def _file_for(self, collection: str | None) -> Path:
         if self.root.suffix.lower() == ".json":
-            return self.root    # single-collection store; collection ignored
+            return self.root  # single-collection store; collection ignored
         if collection is None:
             raise AdapterError(
                 f"resource '{self.name}': a 'collection' is required unless 'path' "

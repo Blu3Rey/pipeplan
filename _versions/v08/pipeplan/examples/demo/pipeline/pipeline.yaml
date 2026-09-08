@@ -1,0 +1,62 @@
+# PipePlan demo blueprint (apiVersion pipeplan/v1).
+# Run it with examples/demo/run_demo.py, which sets DATA_DIR and the checkpoint
+# directory and generates the source data first.
+
+apiVersion: pipeplan/v1
+kind: Pipeline
+
+metadata:
+  id: sales_demo
+  owner: data-engineering
+  description: End-to-end sales pipeline exercising the full v1 feature set.
+
+imports:
+  - vars.yaml
+  - resources.yaml
+  - schemas.yaml
+  - tasks/extract.yaml
+  - tasks/transform.yaml
+  - tasks/load.yaml
+
+settings:
+  timezone: America/New_York
+  engine: pandas
+
+parameters:
+  run_date:
+    type: date
+    default: "2026-01-01"
+
+partition:
+  field: order_date
+  granularity: day
+  bounds:
+    start: "${param:run_date}"
+    lookback: 1d
+
+defaults:
+  retry: { attempts: 2, delay: 1s, backoff: 2 }
+  on_failure: fail
+  checkpoint: true
+
+templates:
+  strict_transform:
+    stage: transform
+    validate: strict
+
+orchestration:
+  max_parallelism: 4
+  fail_fast: true
+  checkpoint:
+    enabled: true
+    store: "${env:PIPEPLAN_CHECKPOINT_DIR}"
+    reuse: true
+  watermark_store:
+    resource: warehouse
+    table: pipeplan_watermarks
+  notifications:
+    on_failure:
+      - { type: log }
+  sla:
+    max_runtime: 30m
+    warn_after: 20m
