@@ -1,7 +1,15 @@
 # PipePlan — User's Guide
 
 **A declarative, configuration-driven batch ETL framework on pandas.**
-Blueprint format: `apiVersion: pipeplan/v1` · Package version: `1.0.0`
+Blueprint format: `apiVersion: pipeplan/v1`
+
+> **Currency.** This edition reflects the adapter/load-layer iteration: adapters
+> are a registry-driven extension point (open `adapter` string) with three bundled
+> families — `file`, `db` (SQLAlchemy + a pluggable SQL **dialect** layer), and a
+> new `document` (JSON/NoSQL) family; write modes are pluggable **load
+> strategies**; the compute AST gained a `case` conditional; and there are now
+> **seven** entry-point groups. See the CHANGELOG for the full addition /
+> modification / deletion list.
 
 PipePlan describes an entire batch ETL pipeline as a set of modular YAML (or JSON)
 blueprints. The engine validates every blueprint with **Pydantic v2**, builds a
@@ -294,15 +302,36 @@ string.
 
 ## 8. Resources and adapters
 
-A **resource** is a named handle to something outside the pipeline. There are two
-adapter families, and the distinction is a hard architectural rule, not a
-convenience:
+A **resource** is a named handle to something outside the pipeline. Adapters are
+the extract-and-load extension point, **resolved from a registry** (entry-point
+group `pipeplan.adapters`) by the resource's `adapter` kind. The `adapter` value
+is an **open validated string**, not a closed enum — a new resource family is
+first-class without any schema change, so long as an `Adapter` subclass is
+registered under that kind. (Prior to the 1.x adapter refactor, `adapter` was a
+fixed `AdapterKind` enum limited to `file`/`db`; that enum has been retired.)
 
-- **`file` adapters** use standard pandas I/O: Excel, CSV, TSV, JSON, parquet.
-- **`db` adapters** use SQLAlchemy for **every** database — including local
-  file-backed engines like **SQLite** and **MS Access** (via an ODBC connection
-  string), *never* raw file reads. An Access `.accdb` or a `.sqlite` file is a
-  `db` resource with a connection URI, not a `file` resource.
+Every adapter implements one storage-agnostic contract —
+`read(collection) -> DataFrame` and `write_batch(requests)` over the shared
+`LoadMode` vocabulary — so the load *modes* mean the same thing across every
+family while each family implements them in its own terms. A resource's `allow`
+list is enforced inside the adapter, and `create_adapter` (the factory) resolves
+the kind from the `ADAPTERS` registry.
+
+**Three families ship in-tree:**
+
+- **`file`** — pandas file I/O (Excel, CSV, TSV, JSON, parquet). Supports
+  `replace`/`append` only; writes are **atomic** (temp-file + rename) and appends
+  align columns by name. Relational modes require a `db` resource.
+- **`db`** — relational, via SQLAlchemy, for **every** database from SQLite and
+  MS Access to Postgres, MySQL, and SQL Server. A local `.accdb`/`.sqlite` file
+  is a `db` resource with a connection URI, *never* a `file` resource. Lives in
+  its own `adapters/sql/` subpackage and supports the full set of load modes.
+- **`document`** — JSON / NoSQL document stores (the shape of MongoDB, DynamoDB,
+  Firestore, CouchDB). **Nested documents flatten to dotted columns on read and
+  are rebuilt on write**, so the tiered pandas transforms operate on a flat frame
+  and the sink still receives real nested documents. `replace`/`append`/`upsert`/
+  `delete` are implemented natively per-document by key with no SQL; `scd2` is
+  rejected as a relational-only pattern.
 
 ```yaml
 resources:
@@ -322,7 +351,25 @@ resources:
       engine: access
       uri: "access+pyodbc://@${env:ACCESS_DIR}/legacy.accdb"
     allow: [read]
+
+  events_store:
+    adapter: document                # JSON / NoSQL document store
+    params: { path: "${env:DOC_DIR}/events" }
+    allow: [read, write]
 ```
+
+### SQL dialects
+
+Within the `db` family, the set-based SQL each load mode emits is produced by a
+**dialect compiler**, not inlined per operation. `SqlLoadTarget` owns the
+mechanics (connection, staging, introspection); a `SqlDialect` owns the *spelling*
+of each statement, resolved via `resolve_dialect(engine)`. This is what lets one
+`upsert`/`delete`/`scd2` declaration compile correctly across very different
+backends: mainstream engines get correlated-subquery `UPDATE`s and native
+`ON CONFLICT` upserts with `1`/`0` booleans, while **MS Access** gets JOIN-based
+`UPDATE`/`DELETE`/history-close statements, a simulated (update-then-insert)
+upsert, and `-1`/`0` booleans. New dialects register under the
+`pipeplan.sql_dialects` entry-point group (see §19).
 
 ### The `allow` permission list
 
@@ -714,6 +761,36 @@ nodes key on the operator symbol with a list of operands; function nodes use
 Built-in functions dispatch through the **expression registry**, which is
 extensible via the `pipeplan.expressions` entry-point group (§19).
 
+#### `case` — multi-branch conditional values
+
+A `case` node lets `derive` produce a value chosen by condition — the piece that
+makes multi-variable business logic (tiering, scoring, bucketing) expressible in a
+single declarative step. Each `when` clause pairs a **predicate** (the full filter
+grammar above — `AND`/`OR`/`NOT`, `==`, `>`, `in`, `between`, …) with an
+**expression** branch; the first matching clause wins, and `default` supplies the
+fallback. It compiles to a vectorised `np.select`, so there is no row iteration
+even with many branches, and clauses nest arbitrarily.
+
+```yaml
+- action: derive
+  with:
+    target: loyalty_tier
+    expr:
+      case:
+        when:
+          - if:   { AND: [ { status: { op: "==", value: Active } },
+                           { tenure_years: { op: ">=", value: 5 } } ] }
+            then: { lit: gold }
+          - if:   { tenure_years: { op: ">=", value: 2 } }
+            then: { lit: silver }
+        default: { lit: bronze }
+```
+
+Because a `when` condition reuses the predicate evaluator, it shares the same
+dtype-coercion behaviour as `filter`. The node lives entirely in the compute AST
+— `derive` needed no change to gain it, and branches may themselves be arithmetic
+nodes, `col`/`lit` leaves, function calls, or further `case` nodes.
+
 ---
 
 ## 13. Schema contracts and expectations
@@ -762,8 +839,12 @@ run their checks vectorised against the live frame.
 
 ## 14. Loading: write modes
 
-Every load step names a `mode`. All modes are **idempotent** for a given
-key/partition, and loaders support chunked writes.
+Every load step names a `mode`. Each mode is a **load strategy** resolved from a
+registry (entry-point group `pipeplan.load_strategies`) rather than a hardcoded
+branch, so new modes (`merge`, soft-delete, `scd4`, …) can be added out-of-tree
+without editing the core (see §19). All modes are **idempotent** for a given
+key/partition; strategies are set-based, use explicit column lists (never
+`SELECT *`), and stage into uniquely-named temp tables.
 
 | Mode | Behaviour |
 |------|-----------|
@@ -792,6 +873,28 @@ frame, which keeps large fact tables stable across re-runs:
   mode: replace
   write: { partition_by: [order_date] }
 ```
+
+### Load guarantees
+
+- **Atomic per task.** All of a load task's steps run in **one transaction**
+  (SQLite included — the adapter enables transactional DDL), so a multi-table load
+  either fully lands or fully rolls back. Retrying a failed load task is therefore
+  safe.
+- **Schema-preserving `replace`.** `replace` **truncates and reloads** rather than
+  dropping the table, so primary keys, indexes, and column types survive across
+  runs. When a target must be created, its DDL is derived from the step's schema
+  contract (typed columns, `NOT NULL`, primary key) instead of pandas type
+  inference.
+- **Watermarks commit only on success.** An incremental cursor (§15) advances
+  *after* the dependent load succeeds, never at read time, so a failed load cannot
+  skip rows on the next run.
+- **Deterministic incremental SCD2.** Only current rows' key + tracked columns are
+  read to detect change; superseded versions are closed with one set-based
+  `UPDATE` and new versions inserted — unchanged rows are never rewritten.
+- **Adapter-specific reach.** `db` covers every relational mode via the dialect
+  layer (§8). The `document` adapter implements `replace`/`append`/`upsert`/
+  `delete` natively per-document and rejects `scd2`. `file` resources support
+  `replace`/`append` only, with atomic temp-file + rename writes.
 
 ---
 
@@ -889,23 +992,78 @@ loaded config can run immediately.
 
 ## 19. Extending PipePlan
 
-The core never imports third-party transforms directly. Contribute new verbs,
-expression functions, notifiers, and secret providers by declaring entry points in
-your own package's `pyproject.toml`:
+The core never imports third-party code directly — **every** extension surface is
+a registry fed by a `pyproject.toml` entry-point group. Seven groups are exposed,
+so almost every axis of the framework is pluggable out-of-tree:
+
+| Entry-point group | Extends | Used as |
+|-------------------|---------|---------|
+| `pipeplan.transforms` | pipeline verbs | a step `action` |
+| `pipeplan.expressions` | compute-AST functions | `{ fn: …, args: […] }` in `derive` |
+| `pipeplan.adapters` | resource families (I/O) | a resource `adapter` kind |
+| `pipeplan.sql_dialects` | per-engine SQL spelling | resolved by `db` `engine` |
+| `pipeplan.load_strategies` | write modes | a load step `mode` |
+| `pipeplan.notifiers` | run-outcome channels | `orchestration.notify.channel` |
+| `pipeplan.secret_providers` | `${secret:…}` backends | secret token resolution |
 
 ```toml
 [project.entry-points."pipeplan.transforms"]
-my_action = "my_pkg.module:MyTransform"
+bucketize = "my_pkg.transforms:Bucketize"
 
 [project.entry-points."pipeplan.expressions"]
-geodistance = "my_pkg.module:geodistance"
+geodistance = "my_pkg.expr:geodistance"
+
+[project.entry-points."pipeplan.adapters"]
+mongodb = "my_pkg.adapters:MongoAdapter"
+
+[project.entry-points."pipeplan.sql_dialects"]
+firebird = "my_pkg.dialects:FirebirdDialect"
+
+[project.entry-points."pipeplan.load_strategies"]
+merge = "my_pkg.load:MergeStrategy"
 
 [project.entry-points."pipeplan.notifiers"]
-slack = "my_pkg.module:make_slack_notifier"
+slack = "my_pkg.notify:make_slack_notifier"
 
 [project.entry-points."pipeplan.secret_providers"]
-vault = "my_pkg.module:make_vault_provider"
+vault = "my_pkg.secrets:make_vault_provider"
 ```
+
+Discovery is lazy and cached: a group is scanned only when a name lookup misses
+the in-tree registry, and in-tree built-ins always win, so a plugin can never
+shadow a core verb. A registration collision raises `RegistryError`; a plugin that
+fails to import surfaces as a `RegistryError` naming the offending entry point.
+
+**Packaging note (resource-first layout).** When one integration spans several
+surfaces — say a REST backend that needs a custom `adapter`, a read-side
+`transform`, and a bespoke `load_strategy` — bundle all of them in **one
+distribution** that versions atomically, with the entry-point group as the
+*secondary* axis inside that package. Do not split a single integration across
+packages by stage (extract/transform/load): one adapter routinely spans multiple
+stages, so stage is the wrong seam.
+
+### Writing an adapter
+
+A resource family is one `Adapter` subclass implementing the storage-agnostic
+contract, registered under its kind:
+
+```python
+import pandas as pd
+from pipeplan.adapters.base import Adapter, WriteRequest, LoadResult
+from pipeplan.core.registry import register_adapter
+
+@register_adapter("mongodb")
+class MongoAdapter(Adapter):
+    def read(self, collection: str) -> pd.DataFrame:
+        ...                                   # return a flat frame
+    def write_batch(self, requests: list[WriteRequest]) -> LoadResult:
+        ...                                   # honour each request's LoadMode
+```
+
+The factory resolves the resource's `adapter` kind from the `ADAPTERS` registry,
+so the new family is usable the moment the package is installed — no core edit,
+no schema change (the `adapter` field is an open validated string). The `allow`
+permission list is enforced by the base class.
 
 ### Writing a transform
 
@@ -1111,16 +1269,23 @@ pipeplan run      pipeline.yaml --param run_date=2026-01-01
 `isnull` `notnull` `contains` `startswith` `endswith`; combinators `AND`/`OR`/`NOT`.
 
 **Expression nodes:** `{ col: }`, `{ lit: }`, operator-keyed `{ "*": [...] }`,
-`{ fn:, args: }`.
+`{ fn:, args: }`, and `{ case: { when: [{ if:, then: }], default: } }`.
 
-**Load modes:** `replace` (partition-scoped), `append`, `upsert`, `delete`,
-`scd2`.
+**Adapter families (bundled):** `file` (pandas I/O; replace/append, atomic),
+`db` (SQLAlchemy + dialects; all modes), `document` (JSON/NoSQL; nested
+flatten/rebuild; no scd2). `adapter` kind is an open registered string.
 
-**Incremental:** `incremental: { strategy: watermark, cursor, lookback, initial }`.
+**Load modes (registry-driven strategies):** `replace` (partition-scoped,
+schema-preserving truncate+reload), `append`, `upsert`, `delete`, `scd2`. Loads
+are atomic per task.
+
+**Incremental:** `incremental: { strategy: watermark, cursor, lookback, initial }`;
+cursor commits only on successful load.
 
 **CLI:** `pipeplan validate|run|schema`, flags `--param K=V`, `--strict`, `-v/-vv`.
 
-**Entry-point groups:** `pipeplan.transforms`, `pipeplan.expressions`,
+**Entry-point groups (7):** `pipeplan.transforms`, `pipeplan.expressions`,
+`pipeplan.adapters`, `pipeplan.sql_dialects`, `pipeplan.load_strategies`,
 `pipeplan.notifiers`, `pipeplan.secret_providers`.
 
 **Exceptions:** `PipePlanError` (base), `ConfigError`, `InterpolationError`,

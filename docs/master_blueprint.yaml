@@ -2,10 +2,17 @@
 # PipePlan master blueprint — the canonical v1 reference (apiVersion pipeplan/v1)
 # =============================================================================
 # A single, fully-annotated pipeline that exercises every feature of the
-# framework: all interpolation namespaces, both adapter families, all three
-# transform tiers and every built-in verb, both AST subsystems (filter + compute),
-# schema contracts and expectations, all five load modes, incremental watermark
-# extract, and the full orchestration block.
+# framework: all interpolation namespaces, the registry-driven adapter families
+# (file / db+dialects / document), all three transform tiers and every built-in
+# verb (including the `case` compute node and `compare_diff` CDC), both AST
+# subsystems (filter + compute), schema contracts and expectations, all five load
+# modes (as pluggable load strategies), incremental watermark extract, and the
+# full orchestration block.
+#
+# Adapters are resolved from a registry (entry-point group `pipeplan.adapters`);
+# `adapter` is an OPEN validated string, so custom families are first-class. Load
+# modes are registry-driven strategies (`pipeplan.load_strategies`) and the `db`
+# family compiles per-engine SQL via a dialect layer (`pipeplan.sql_dialects`).
 #
 # Four defects from the original pre-1.0 JSON template are fixed here and called
 # out inline where they occur:
@@ -137,11 +144,17 @@ schemas:
       margin:      { dtype: float }
 
 # --------------------------------------------------------------------------- #
-# resources — handles to the outside world. Two adapter families:
-#   • file → pandas I/O (excel/csv/tsv/json/parquet)
-#   • db   → SQLAlchemy for EVERY database, including local SQLite & MS Access
-#            (via ODBC). A local .accdb/.sqlite is a `db` resource with a URI,
-#            never a `file` resource.
+# resources — handles to the outside world. `adapter` is an OPEN string resolved
+# from the `pipeplan.adapters` registry; three families ship in-tree:
+#   • file     → pandas I/O (excel/csv/tsv/json/parquet); replace/append only,
+#                atomic (temp-file + rename) writes.
+#   • db       → SQLAlchemy for EVERY database, including local SQLite & MS Access
+#                (via ODBC); all load modes, per-engine SQL via the dialect layer.
+#                A local .accdb/.sqlite is a `db` resource with a URI, not `file`.
+#   • document → JSON/NoSQL document store (MongoDB/DynamoDB/Firestore shape);
+#                nested docs flatten to dotted columns on read, rebuilt on write;
+#                replace/append/upsert/delete native per-document; scd2 rejected.
+# A custom family (a REST API, an object store) is one registered Adapter subclass.
 # `allow` is enforced inside the adapter, so a task cannot bypass it.
 # --------------------------------------------------------------------------- #
 resources:
@@ -185,9 +198,15 @@ resources:
   legacy_access:
     adapter: db                                             # FIX (2): ${env:...} namespace
     params:
-      engine: access
+      engine: access                                        # dialect layer emits Access-specific SQL
       uri: "access+pyodbc://@${env:ACCESS_DIR}/legacy.accdb"
     allow: [read]
+
+  # --- document adapter (JSON / NoSQL) ------------------------------------- #
+  events_store:
+    adapter: document                                       # nested docs ⇄ dotted columns
+    params: { path: "${env:DOC_DIR}/events" }
+    allow: [read, write]
 
 # --------------------------------------------------------------------------- #
 # tasks — the DAG. depends_on is ADDITIVE: the orchestrator always adds the
@@ -288,8 +307,21 @@ tasks:
           target: award_amount_k
           expr: { "/": [{ col: award_amount }, { lit: 1000 }] }
 
+      - action: derive                                      # `case` node: multi-branch conditional
+        with:
+          target: priority_tier                             # first matching `when` wins; else `default`
+          expr:
+            case:
+              when:
+                - if:   { AND: [ { status: { op: "==", value: Active } },
+                                 { award_amount: { op: ">=", value: "${var:high_value_threshold}" } } ] }
+                  then: { lit: platinum }
+                - if:   { award_amount: { op: between, value: [50000, 250000] } }
+                  then: { lit: gold }
+              default: { lit: standard }
+
       - action: select                                      # Element-tier projection + reorder
-        with: [grant_id, title, status, award_number, award_amount, award_amount_k, submitted_on]
+        with: [grant_id, title, status, award_number, award_amount, award_amount_k, priority_tier, submitted_on]
     expectations:                                           # soft data-quality assertions
       - { name: keys_present, assert: { column: grant_id, not_null: true } }
       - { name: nonempty,     assert: { row_count: { ">=": 1 } } }
@@ -425,7 +457,10 @@ tasks:
           duplicate_keys: error                             # error | keep_first | keep_last
 
   # ========================= LOAD ========================================= #
-  # Every mode is idempotent for a given key/partition; loaders chunk writes.
+  # Each `mode` is a registry-driven load STRATEGY (pipeplan.load_strategies),
+  # not a hardcoded branch. All modes are idempotent for a given key/partition;
+  # a load task's steps run in ONE transaction (atomic: all land or all roll
+  # back). `replace` is schema-preserving (truncate+reload, keeps PKs/indexes).
 
   load_warehouse:
     stage: load
@@ -461,3 +496,11 @@ tasks:
     steps:
       # the quarantine frame produced by cast on_error: quarantine
       - { collection: grants_rejected, input: grants_clean__rejected, mode: replace }
+
+  publish_documents:
+    stage: load
+    resource: events_store                                  # document adapter sink
+    depends_on: [enrich_grants]
+    steps:
+      # flat frame → nested JSON documents, upserted by key (no SQL); scd2 N/A here
+      - { collection: grant_events, input: grants_enriched, mode: upsert, key: grant_id }
